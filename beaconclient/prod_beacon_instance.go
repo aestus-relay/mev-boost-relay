@@ -86,7 +86,7 @@ type AllValidatorsResponse struct {
 }
 
 func fetchAllValidators(endpoint string, headSlot uint64) (*AllValidatorsResponse, error) {
-	uri := fmt.Sprintf("%s/eth/v1/beacon/states/%d/validators?status=active,pending", endpoint, headSlot)
+	uri := fmt.Sprintf("%s/eth/v1/beacon/states/%d/validators?status=active_ongoing,active_exiting,pending_initialized,pending_queued", endpoint, headSlot)
 	// https://ethereum.github.io/beacon-APIs/#/Beacon/getStateValidators
 	vd := new(AllValidatorsResponse)
 	_, err := fetchBeacon(http.MethodGet, uri, nil, vd)
