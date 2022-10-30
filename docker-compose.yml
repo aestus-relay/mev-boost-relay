@@ -7,17 +7,23 @@ volumes:
 services:
   redis:
     image: redis
+    container_name: relay-redis
     restart: always
     ports:
       - '6379:6379'
+    networks:
+      - relaydb
 
   db:
     image: postgres
+    container_name: relay-db
     restart: always
     volumes:
       - 'psql_data:/var/lib/postgresql/data'
     ports:
       - '5432:5432'
+    networks:
+      - relaydb
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
@@ -25,10 +31,18 @@ services:
 
   adminer:
     image: adminer
+    container_name: relay_adminer
     restart: always
     depends_on:
       - db
     ports:
       - '8093:8080'
+    networks:
+      - relaydb
     environment:
       ADMINER_PLUGINS: tables-filter tinymce
+
+networks:
+  relaydb:
+    name: relaydb
+    driver: bridge
