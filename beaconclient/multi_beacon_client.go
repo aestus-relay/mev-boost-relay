@@ -4,16 +4,19 @@ package beaconclient
 import (
 	"errors"
 	"os"
+	"strings"
 	"sync"
 
 	"github.com/flashbots/go-boost-utils/types"
+	"github.com/flashbots/mev-boost-relay/common"
 	"github.com/sirupsen/logrus"
 	uberatomic "go.uber.org/atomic"
 )
 
 var (
-	ErrBeaconNodeSyncing      = errors.New("beacon node is syncing or unavailable")
-	ErrBeaconNodesUnavailable = errors.New("all beacon nodes responded with error")
+	ErrBeaconNodeSyncing        = errors.New("beacon node is syncing or unavailable")
+	ErrBeaconNodesUnavailable   = errors.New("all beacon nodes responded with error")
+	ErrWithdrawalsBeforeCapella = errors.New("withdrawals are not supported before capella")
 )
 
 // IMultiBeaconClient is the interface for the MultiBeaconClient, which can manage several beacon client instances under the hood
@@ -24,11 +27,13 @@ type IMultiBeaconClient interface {
 	// FetchValidators returns all active and pending validators from the beacon node
 	FetchValidators(headSlot uint64) (map[types.PubkeyHex]ValidatorResponseEntry, error)
 	GetProposerDuties(epoch uint64) (*ProposerDutiesResponse, error)
-	PublishBlock(block *types.SignedBeaconBlock) (code int, err error)
+	PublishBlock(block *common.SignedBeaconBlock) (code int, err error)
 	GetGenesis() (*GetGenesisResponse, error)
 	GetSpec() (spec *GetSpecResponse, err error)
+	GetForkSchedule() (spec *GetForkScheduleResponse, err error)
 	GetBlock(blockID string) (block *GetBlockResponse, err error)
 	GetRandao(slot uint64) (spec *GetRandaoResponse, err error)
+	GetWithdrawals(slot uint64) (spec *GetWithdrawalsResponse, err error)
 }
 
 // IBeaconInstance is the interface for a single beacon client instance
@@ -39,11 +44,13 @@ type IBeaconInstance interface {
 	FetchValidators(headSlot uint64) (map[types.PubkeyHex]ValidatorResponseEntry, error)
 	GetProposerDuties(epoch uint64) (*ProposerDutiesResponse, error)
 	GetURI() string
-	PublishBlock(block *types.SignedBeaconBlock) (code int, err error)
+	PublishBlock(block *common.SignedBeaconBlock) (code int, err error)
 	GetGenesis() (*GetGenesisResponse, error)
 	GetSpec() (spec *GetSpecResponse, err error)
+	GetForkSchedule() (spec *GetForkScheduleResponse, err error)
 	GetBlock(blockID string) (*GetBlockResponse, error)
 	GetRandao(slot uint64) (spec *GetRandaoResponse, err error)
+	GetWithdrawals(slot uint64) (spec *GetWithdrawalsResponse, err error)
 }
 
 type MultiBeaconClient struct {
@@ -195,10 +202,10 @@ func (c *MultiBeaconClient) beaconInstancesByLastResponse() []IBeaconInstance {
 }
 
 // PublishBlock publishes the signed beacon block via https://ethereum.github.io/beacon-APIs/#/ValidatorRequiredApi/publishBlock
-func (c *MultiBeaconClient) PublishBlock(block *types.SignedBeaconBlock) (code int, err error) {
+func (c *MultiBeaconClient) PublishBlock(block *common.SignedBeaconBlock) (code int, err error) {
 	log := c.log.WithFields(logrus.Fields{
-		"slot":      block.Message.Slot,
-		"blockHash": block.Message.Body.ExecutionPayload.BlockHash.String(),
+		"slot":      block.Slot(),
+		"blockHash": block.BlockHash(),
 	})
 
 	clients := c.beaconInstancesByLastResponse()
@@ -253,6 +260,23 @@ func (c *MultiBeaconClient) GetSpec() (spec *GetSpecResponse, err error) {
 	return nil, err
 }
 
+// GetForkSchedule - https://ethereum.github.io/beacon-APIs/#/Config/getForkSchedule
+func (c *MultiBeaconClient) GetForkSchedule() (spec *GetForkScheduleResponse, err error) {
+	clients := c.beaconInstancesByLastResponse()
+	for _, client := range clients {
+		log := c.log.WithField("uri", client.GetURI())
+		if spec, err = client.GetForkSchedule(); err != nil {
+			log.WithError(err).Warn("failed to get fork schedule")
+			continue
+		}
+
+		return spec, nil
+	}
+
+	c.log.WithError(err).Error("failed to get fork schedule on any CL node")
+	return nil, err
+}
+
 // GetBlock returns a block - https://ethereum.github.io/beacon-APIs/#/Beacon/getBlockV2
 func (c *MultiBeaconClient) GetBlock(blockID string) (block *GetBlockResponse, err error) {
 	clients := c.beaconInstancesByLastResponse()
@@ -284,5 +308,30 @@ func (c *MultiBeaconClient) GetRandao(slot uint64) (randaoResp *GetRandaoRespons
 	}
 
 	c.log.WithField("slot", slot).WithError(err).Warn("failed to get randao from any CL node")
+	return nil, err
+}
+
+// GetWithdrawals - 3500/eth/v1/beacon/states/<slot>/withdrawals
+func (c *MultiBeaconClient) GetWithdrawals(slot uint64) (withdrawalsResp *GetWithdrawalsResponse, err error) {
+	clients := c.beaconInstancesByLastResponse()
+	for _, client := range clients {
+		log := c.log.WithField("uri", client.GetURI())
+		if withdrawalsResp, err = client.GetWithdrawals(slot); err != nil {
+			if strings.Contains(err.Error(), "Withdrawals not enabled before capella") {
+				break
+			}
+			log.WithField("slot", slot).WithError(err).Warn("failed to get withdrawals")
+			continue
+		}
+
+		return withdrawalsResp, nil
+	}
+
+	if strings.Contains(err.Error(), "Withdrawals not enabled before capella") {
+		c.log.WithField("slot", slot).WithError(err).Debug("failed to get withdrawals as capella has not been reached")
+		return nil, ErrWithdrawalsBeforeCapella
+	}
+
+	c.log.WithField("slot", slot).WithError(err).Warn("failed to get withdrawals from any CL node")
 	return nil, err
 }

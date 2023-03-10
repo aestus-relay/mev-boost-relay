@@ -19,13 +19,14 @@ var (
 	caser = cases.Title(language.English)
 )
 
-type StatusHTMLData struct {
+type StatusHTMLData struct { //nolint:musttag
 	Network                     string
 	RelayPubkey                 string
 	ValidatorsTotal             uint64
 	ValidatorsRegistered        uint64
 	ValidatorsActive            uint64
 	BellatrixForkVersion        string
+	CapellaForkVersion          string
 	GenesisForkVersion          string
 	GenesisValidatorsRoot       string
 	BuilderSigningDomain        string

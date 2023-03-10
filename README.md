@@ -1,13 +1,19 @@
-# mev-boost Relay
+# MEV-Boost Relay
 
 [![Goreport status](https://goreportcard.com/badge/github.com/flashbots/mev-boost-relay)](https://goreportcard.com/report/github.com/flashbots/mev-boost-relay)
 [![Test status](https://github.com/flashbots/mev-boost-relay/workflows/Checks/badge.svg)](https://github.com/flashbots/mev-boost-relay/actions?query=workflow%3A%22Checks%22)
 
-Flashbots MEV-Boost relay for proposer/builder separation in Ethereum. Currently live at:
+MEV-Boost Relay for Ethereum proposer/builder separation (PBS).
 
-* https://boost-relay.flashbots.net
-* https://boost-relay-sepolia.flashbots.net
-* https://boost-relay-goerli.flashbots.net
+Currently live at:
+
+* https://boost-relay.flashbots.net (also on [Goerli](https://boost-relay-sepolia.flashbots.net) and [Sepolia](https://boost-relay-goerli.flashbots.net))
+* https://relay.ultrasound.money
+* https://agnostic-relay.net
+* https://relay.edennetwork.io/info
+* https://relayooor.wtf
+* https://mainnet-relay.securerpc.com
+* https://mainnet.aestus.live
 
 The relay consists of several components that are designed to run and scale independently and to be as simple as possible:
 
@@ -15,17 +21,21 @@ The relay consists of several components that are designed to run and scale inde
 1. [Website](https://github.com/flashbots/mev-boost-relay/tree/main/services/website): handles the root website requests (information is pulled from Redis and database).
 1. [Housekeeper](https://github.com/flashbots/mev-boost-relay/tree/main/services/housekeeper): update known validators, proposer duties.
 
-Dependencies: Redis, PostgreSQL, one or more beacon nodes, and block submission validation nodes.
+Dependencies:
 
-This software is currently in **beta state**, and slowly stabilizing.
+1. Redis
+1. PostgreSQL
+1. one or more beacon nodes
+1. block submission validation nodes
 
 A security assessment for the relay was conducted on 2022-08-22 by [lotusbumi](https://github.com/lotusbumi). Additional information can be found in the [Security](#security) section of this repository.
 
-See also:
+**See also:**
 
-* [Relay API docs](https://flashbots.notion.site/Relay-API-Spec-5fb0819366954962bc02e81cb33840f5)
 * [Docker images](https://hub.docker.com/r/flashbots/mev-boost-relay)
 * [mev-boost](https://github.com/flashbots/mev-boost)
+* [Relay API specs](https://flashbots.github.io/relay-specs)
+* [Guider for running mev-boost-relay at scale](https://flashbots.notion.site/Running-mev-boost-relay-at-scale-draft-4040ccd5186c425d9a860cbb29bbfe09)
 
 ---
 
@@ -113,6 +123,11 @@ redis-cli DEL boost-relay/sepolia:validators-registration boost-relay/sepolia:va
 * `NUM_VALIDATOR_REG_PROCESSORS` - proposer API - number of goroutines to listen to the validator registration channel
 * `ACTIVE_VALIDATOR_HOURS` - number of hours to track active proposers in redis (default: 3)
 * `GETPAYLOAD_RETRY_TIMEOUT_MS` - getPayload retry getting a payload if first try failed (default: 100)
+* `API_TIMEOUT_READ_MS` - http read timeout in milliseconds (default: 1500)
+* `API_TIMEOUT_READHEADER_MS` - http read header timeout in milliseconds (default: 600)
+* `API_TIMEOUT_WRITE_MS` - http write timeout in milliseconds (default: 10000)
+* `API_TIMEOUT_IDLE_MS` - http idle timeout in milliseconds (default: 3000)
+* `BLOCKSIM_TIMEOUT_MS` - builder block submission validation request timeout (default: 3000)
 
 ### Updating the website
 

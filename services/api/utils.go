@@ -3,7 +3,10 @@ package api
 import (
 	"errors"
 
+	"github.com/attestantio/go-eth2-client/spec/capella"
+	"github.com/attestantio/go-eth2-client/spec/phase0"
 	"github.com/flashbots/go-boost-utils/types"
+	"github.com/flashbots/mev-boost-relay/common"
 )
 
 var (
@@ -11,12 +14,12 @@ var (
 	ErrParentHashMismatch = errors.New("parentHash mismatch")
 )
 
-func SanityCheckBuilderBlockSubmission(payload *types.BuilderSubmitBlockRequest) error {
-	if payload.Message.BlockHash != payload.ExecutionPayload.BlockHash {
+func SanityCheckBuilderBlockSubmission(payload *common.BuilderSubmitBlockRequest) error {
+	if payload.BlockHash() != payload.ExecutionPayloadBlockHash() {
 		return ErrBlockHashMismatch
 	}
 
-	if payload.Message.ParentHash != payload.ExecutionPayload.ParentHash {
+	if payload.ParentHash() != payload.ExecutionPayloadParentHash() {
 		return ErrParentHashMismatch
 	}
 
@@ -26,4 +29,9 @@ func SanityCheckBuilderBlockSubmission(payload *types.BuilderSubmitBlockRequest)
 func checkBLSPublicKeyHex(pkHex string) error {
 	var proposerPubkey types.PublicKey
 	return proposerPubkey.UnmarshalText([]byte(pkHex))
+}
+
+func ComputeWithdrawalsRoot(w []*capella.Withdrawal) (phase0.Root, error) {
+	withdrawals := capella.Withdrawals{Withdrawals: w}
+	return withdrawals.HashTreeRoot()
 }

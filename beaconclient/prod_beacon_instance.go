@@ -6,7 +6,9 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/attestantio/go-eth2-client/spec/capella"
 	"github.com/flashbots/go-boost-utils/types"
+	"github.com/flashbots/mev-boost-relay/common"
 	"github.com/r3labs/sse/v2"
 	"github.com/sirupsen/logrus"
 )
@@ -205,7 +207,7 @@ func (c *ProdBeaconInstance) GetURI() string {
 	return c.beaconURI
 }
 
-func (c *ProdBeaconInstance) PublishBlock(block *types.SignedBeaconBlock) (code int, err error) {
+func (c *ProdBeaconInstance) PublishBlock(block *common.SignedBeaconBlock) (code int, err error) {
 	uri := fmt.Sprintf("%s/eth/v1/beacon/blocks", c.beaconURI)
 	return fetchBeacon(http.MethodPost, uri, block, nil)
 }
@@ -243,6 +245,22 @@ func (c *ProdBeaconInstance) GetSpec() (spec *GetSpecResponse, err error) {
 	return resp, err
 }
 
+type GetForkScheduleResponse struct {
+	Data []struct {
+		PreviousVersion string `json:"previous_version"`
+		CurrentVersion  string `json:"current_version"`
+		Epoch           uint64 `json:"epoch,string"`
+	}
+}
+
+// GetForkSchedule - https://ethereum.github.io/beacon-APIs/#/Config/getForkSchedule
+func (c *ProdBeaconInstance) GetForkSchedule() (spec *GetForkScheduleResponse, err error) {
+	uri := fmt.Sprintf("%s/eth/v1/config/fork_schedule", c.beaconURI)
+	resp := new(GetForkScheduleResponse)
+	_, err = fetchBeacon(http.MethodGet, uri, nil, resp)
+	return resp, err
+}
+
 type GetRandaoResponse struct {
 	Data struct {
 		Randao string `json:"randao"`
@@ -253,6 +271,20 @@ type GetRandaoResponse struct {
 func (c *ProdBeaconInstance) GetRandao(slot uint64) (randaoResp *GetRandaoResponse, err error) {
 	uri := fmt.Sprintf("%s/eth/v1/beacon/states/%d/randao", c.beaconURI, slot)
 	resp := new(GetRandaoResponse)
+	_, err = fetchBeacon(http.MethodGet, uri, nil, resp)
+	return resp, err
+}
+
+type GetWithdrawalsResponse struct {
+	Data struct {
+		Withdrawals []*capella.Withdrawal `json:"withdrawals"`
+	}
+}
+
+// GetWithdrawals - /eth/v1/beacon/states/<slot>/withdrawals
+func (c *ProdBeaconInstance) GetWithdrawals(slot uint64) (withdrawalsResp *GetWithdrawalsResponse, err error) {
+	uri := fmt.Sprintf("%s/eth/v1/beacon/states/%d/withdrawals", c.beaconURI, slot)
+	resp := new(GetWithdrawalsResponse)
 	_, err = fetchBeacon(http.MethodGet, uri, nil, resp)
 	return resp, err
 }
