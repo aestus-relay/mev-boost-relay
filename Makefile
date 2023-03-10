@@ -1,5 +1,9 @@
 VERSION ?= $(shell git describe --tags --always --dirty="-dev")
 
+export CGO_CFLAGS := "-D__BLST_PORTABLE__"
+export CGO_CFLAGS_ALLOW := "-D__BLST_PORTABLE__"
+
+
 all: clean build
 
 v:
