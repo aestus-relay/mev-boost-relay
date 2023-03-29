@@ -14,6 +14,12 @@ services:
     networks:
       - relaydb
 
+  memcached:
+    image: memcached
+    restart: always
+    ports:
+      - '11211:11211'
+
   db:
     image: postgres
     container_name: relay-db

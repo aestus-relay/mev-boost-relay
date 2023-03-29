@@ -46,6 +46,7 @@ var (
 	ErrServerAlreadyStarted       = errors.New("server was already started")
 	ErrBuilderAPIWithoutSecretKey = errors.New("cannot start builder API without secret key")
 	ErrMismatchedForkVersions     = errors.New("can not find matching fork versions as retrieved from beacon node")
+	ErrMissingForkVersions        = errors.New("invalid bellatrix/capella fork version from beacon node")
 )
 
 var (
@@ -89,6 +90,7 @@ type RelayAPIOpts struct {
 	BeaconClient beaconclient.IMultiBeaconClient
 	Datastore    *datastore.Datastore
 	Redis        *datastore.RedisCache
+	Memcached    *datastore.Memcached
 	DB           database.IDatabaseService
 
 	SecretKey *bls.SecretKey // used to sign bids (getHeader responses)
@@ -128,6 +130,7 @@ type RelayAPI struct {
 	beaconClient beaconclient.IMultiBeaconClient
 	datastore    *datastore.Datastore
 	redis        *datastore.RedisCache
+	memcached    *datastore.Memcached
 	db           database.IDatabaseService
 
 	headSlot       uberatomic.Uint64
@@ -150,9 +153,13 @@ type RelayAPI struct {
 	getPayloadCallsInFlight sync.WaitGroup
 
 	// Feature flags
-	ffForceGetHeader204      bool
-	ffDisableBlockPublishing bool
-	ffDisableLowPrioBuilders bool
+	ffForceGetHeader204           bool
+	ffDisableBlockPublishing      bool
+	ffDisableLowPrioBuilders      bool
+	ffDisablePayloadDBStorage     bool // disable storing the execution payloads in the database
+	ffDisableSSEPayloadAttributes bool // instead of SSE, fall back to previous polling withdrawals+prevRandao from our custom Prysm fork
+
+	latestParentBlockHash uberatomic.String // used to cache the latest parent block hash, to avoid repetitive similar SSE events
 
 	expectedPrevRandao         randaoHelper
 	expectedPrevRandaoLock     sync.RWMutex
@@ -213,6 +220,7 @@ func NewRelayAPI(opts RelayAPIOpts) (api *RelayAPI, err error) {
 		datastore:              opts.Datastore,
 		beaconClient:           opts.BeaconClient,
 		redis:                  opts.Redis,
+		memcached:              opts.Memcached,
 		db:                     opts.DB,
 		proposerDutiesResponse: []boostTypes.BuilderGetValidatorsResponseEntry{},
 		blockSimRateLimiter:    NewBlockSimulationRateLimiter(opts.BlockSimURL),
@@ -234,6 +242,16 @@ func NewRelayAPI(opts RelayAPIOpts) (api *RelayAPI, err error) {
 	if os.Getenv("DISABLE_LOWPRIO_BUILDERS") == "1" {
 		api.log.Warn("env: DISABLE_LOWPRIO_BUILDERS - allowing only high-level builders")
 		api.ffDisableLowPrioBuilders = true
+	}
+
+	if os.Getenv("DISABLE_PAYLOAD_DATABASE_STORAGE") == "1" {
+		api.log.Warn("env: DISABLE_PAYLOAD_DATABASE_STORAGE - disabling storing payloads in the database")
+		api.ffDisablePayloadDBStorage = true
+	}
+
+	if os.Getenv("DISABLE_SSE_PAYLOAD_ATTRIBUTES") == "1" {
+		api.log.Warn("env: DISABLE_SSE_PAYLOAD_ATTRIBUTES - using previous polling logic for withdrawals and randao (requires custom Prysm fork)")
+		api.ffDisableSSEPayloadAttributes = true
 	}
 
 	return api, nil
@@ -287,13 +305,15 @@ func (api *RelayAPI) getRouter() http.Handler {
 }
 
 func (api *RelayAPI) isCapella(slot uint64) bool {
+	if api.capellaEpoch == 0 { // CL didn't yet have it
+		return false
+	}
 	epoch := slot / uint64(common.SlotsPerEpoch)
 	return epoch >= api.capellaEpoch
 }
 
 func (api *RelayAPI) isBellatrix(slot uint64) bool {
-	epoch := slot / uint64(common.SlotsPerEpoch)
-	return epoch >= api.bellatrixEpoch && epoch < api.capellaEpoch
+	return !api.isCapella(slot)
 }
 
 // StartServer starts the HTTP server for this instance
@@ -308,6 +328,10 @@ func (api *RelayAPI) StartServer() (err error) {
 		return err
 	}
 
+	// Helpers
+	currentSlot := bestSyncStatus.HeadSlot
+	currentEpoch := currentSlot / uint64(common.SlotsPerEpoch)
+
 	api.genesisInfo, err = api.beaconClient.GetGenesis()
 	if err != nil {
 		return err
@@ -319,7 +343,9 @@ func (api *RelayAPI) StartServer() (err error) {
 		return err
 	}
 
+	// Parse forkSchedule
 	for _, fork := range forkSchedule.Data {
+		api.log.Infof("forkSchedule: version=%s / epoch=%d", fork.CurrentVersion, fork.Epoch)
 		switch fork.CurrentVersion {
 		case api.opts.EthNetDetails.BellatrixForkVersionHex:
 			api.bellatrixEpoch = fork.Epoch
@@ -328,12 +354,14 @@ func (api *RelayAPI) StartServer() (err error) {
 		}
 	}
 
-	currentSlot := bestSyncStatus.HeadSlot
-	currentEpoch := currentSlot / uint64(common.SlotsPerEpoch)
+	// Print fork version information
 	if api.isCapella(currentSlot) {
-		api.log.Infof("capella fork detected, startEpoch: %d / currentEpoch: %d", api.capellaEpoch, currentEpoch)
+		api.log.Infof("capella fork detected (currentEpoch: %d / bellatrixEpoch: %d / capellaEpoch: %d)", currentEpoch, api.bellatrixEpoch, api.capellaEpoch)
 	} else if api.isBellatrix(currentSlot) {
-		api.log.Infof("bellatrix fork detected. capellaStartEpoch: %d / currentEpoch: %d", api.capellaEpoch, currentEpoch)
+		api.log.Infof("bellatrix fork detected (currentEpoch: %d / bellatrixEpoch: %d / capellaEpoch: %d)", currentEpoch, api.bellatrixEpoch, api.capellaEpoch)
+		if api.capellaEpoch == 0 {
+			api.log.Infof("no capella fork scheduled. update your beacon-node in time.")
+		}
 	} else {
 		return ErrMismatchedForkVersions
 	}
@@ -374,6 +402,19 @@ func (api *RelayAPI) StartServer() (err error) {
 			api.processNewSlot(headEvent.Slot)
 		}
 	}()
+
+	// Start regular payload attributes updates only if builder-api is enabled
+	// and if using see subscriptions instead of querying for payload attributes
+	if api.opts.BlockBuilderAPI && !api.ffDisableSSEPayloadAttributes {
+		go func() {
+			c := make(chan beaconclient.PayloadAttributesEvent)
+			api.beaconClient.SubscribeToPayloadAttributesEvents(c)
+			for {
+				payloadAttributes := <-c
+				api.processPayloadAttributes(payloadAttributes)
+			}
+		}()
+	}
 
 	api.srv = &http.Server{
 		Addr:    api.opts.ListenAddr,
@@ -438,6 +479,56 @@ func (api *RelayAPI) startValidatorRegistrationDBProcessor() {
 	}
 }
 
+func (api *RelayAPI) processPayloadAttributes(payloadAttributes beaconclient.PayloadAttributesEvent) {
+	apiHeadSlot := api.headSlot.Load()
+	proposalSlot := payloadAttributes.Data.ProposalSlot
+
+	// require proposal slot in the future
+	if proposalSlot <= apiHeadSlot {
+		return
+	}
+	log := api.log.WithFields(logrus.Fields{
+		"headSlot":     apiHeadSlot,
+		"proposalSlot": proposalSlot,
+	})
+
+	// discard repetitive payload attributes (we receive them once from each beacon node)
+	latestParentBlockHash := api.latestParentBlockHash.Load()
+	if latestParentBlockHash == payloadAttributes.Data.ParentBlockHash {
+		return
+	}
+	api.latestParentBlockHash.Store(payloadAttributes.Data.ParentBlockHash)
+	log = log.WithField("parentBlockHash", payloadAttributes.Data.ParentBlockHash)
+
+	log.Info("updating payload attributes")
+	api.expectedPrevRandaoLock.Lock()
+	prevRandao := payloadAttributes.Data.PayloadAttributes.PrevRandao
+	api.expectedPrevRandao = randaoHelper{
+		slot:       proposalSlot,
+		prevRandao: prevRandao,
+	}
+	api.expectedPrevRandaoLock.Unlock()
+	log.Infof("updated expected prev_randao to %s", prevRandao)
+
+	// Update withdrawals (in Capella only)
+	if api.isBellatrix(proposalSlot) {
+		return
+	}
+	log.Info("updating expected withdrawals")
+	withdrawalsRoot, err := ComputeWithdrawalsRoot(payloadAttributes.Data.PayloadAttributes.Withdrawals)
+	if err != nil {
+		log.WithError(err).Error("error computing withdrawals root")
+		return
+	}
+	api.expectedWithdrawalsLock.Lock()
+	api.expectedWithdrawalsRoot = withdrawalsHelper{
+		slot: proposalSlot,
+		root: withdrawalsRoot,
+	}
+	api.expectedWithdrawalsLock.Unlock()
+	log.Infof("updated expected withdrawals root to %s", withdrawalsRoot)
+}
+
 func (api *RelayAPI) processNewSlot(headSlot uint64) {
 	_apiHeadSlot := api.headSlot.Load()
 	if headSlot <= _apiHeadSlot {
@@ -455,11 +546,14 @@ func (api *RelayAPI) processNewSlot(headSlot uint64) {
 
 	// only for builder-api
 	if api.opts.BlockBuilderAPI {
-		// query the expected prev_randao field
-		go api.updatedExpectedRandao(headSlot)
+		// if not subscribed to payload attributes via sse, query beacon node endpoints
+		if api.ffDisableSSEPayloadAttributes {
+			// query the expected prev_randao field
+			go api.updatedExpectedRandao(headSlot)
 
-		// query expected withdrawals root
-		go api.updatedExpectedWithdrawals(headSlot)
+			// query expected withdrawals root
+			go api.updatedExpectedWithdrawals(headSlot)
+		}
 
 		// update proposer duties in the background
 		go api.updateProposerDuties(headSlot)
@@ -980,7 +1074,7 @@ func (api *RelayAPI) updatedExpectedWithdrawals(slot uint64) {
 	}
 
 	log := api.log.WithField("slot", slot)
-	log.Infof("updating withdrawals root...")
+	log.Info("updating withdrawals root...")
 	api.expectedWithdrawalsLock.Lock()
 	latestKnownSlot := api.expectedWithdrawalsRoot.slot
 	if slot < latestKnownSlot || slot <= api.expectedWithdrawalsUpdating { // do nothing slot is already known or currently being updated
@@ -1069,9 +1163,11 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 	if api.isCapella(currentSlot) && payload.Capella == nil {
 		log.Info("rejecting submission - non capella payload for capella fork")
 		api.RespondError(w, http.StatusBadRequest, "not capella payload")
+		return
 	} else if api.isBellatrix(currentSlot) && payload.Bellatrix == nil {
 		log.Info("rejecting submission - non bellatrix payload for bellatrix fork")
 		api.RespondError(w, http.StatusBadRequest, "not belltrix payload")
+		return
 	}
 
 	log = log.WithFields(logrus.Fields{
@@ -1230,7 +1326,8 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 
 	// At end of this function, save builder submission to database (in the background)
 	defer func() {
-		submissionEntry, err := api.db.SaveBuilderBlockSubmission(payload, simErr, receivedAt, eligibleAt)
+		savePayloadToDatabase := !api.ffDisablePayloadDBStorage
+		submissionEntry, err := api.db.SaveBuilderBlockSubmission(payload, simErr, receivedAt, eligibleAt, savePayloadToDatabase)
 		if err != nil {
 			log.WithError(err).WithField("payload", payload).Error("saving builder block submission to database failed")
 			return
@@ -1271,7 +1368,22 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 		}).Info("block validation successful")
 	}
 
-	// Ensure this request is still the latest one
+	// Ensure this request is still the latest one. This logic intentionally
+	// ignores the value of the bids and makes the current active bid the one
+	// that arrived at the relay last. This allows for builders to reduce the
+	// value of their bid (effectively cancel a high bid) by ensuring a lower
+	// bid arrives later. Even if the higher bid takes longer to simulate,
+	// by checking the receivedAt timestamp, this logic ensures that the low bid
+	// is not overwritten by the high bid.
+	//
+	// NOTE: this can lead to a rather tricky race condition. If a builder
+	// submits two blocks to the relay concurrently, then the randomness of
+	// network latency will make it impossible to predict which arrives first.
+	// Thus a high bid could unintentionally be overwritten by a low bid that
+	// happend to arrive a few microseconds later. If builders are submitting
+	// blocks at a frequency where they cannot reliably predict which bid will
+	// arrive at the relay first, they should instead use multiple pubkeys to
+	// avoid uninitentionally overwriting their own bids.
 	latestPayloadReceivedAt, err := api.redis.GetBuilderLatestPayloadReceivedAt(payload.Slot(), payload.BuilderPubkey().String(), payload.ParentHash(), payload.ProposerPubkey())
 	if err != nil {
 		log.WithError(err).Error("failed getting latest payload receivedAt from redis")
@@ -1319,6 +1431,16 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 		log.WithError(err).Error("failed saving execution payload in redis")
 		api.RespondError(w, http.StatusInternalServerError, err.Error())
 		return
+	}
+
+	// save execution payload to memcached as secondary backup to Redis
+	if api.memcached != nil {
+		err = api.memcached.SaveExecutionPayload(payload.Slot(), payload.ProposerPubkey(), payload.BlockHash(), getPayloadResponse)
+		if err != nil {
+			log.WithError(err).Error("failed saving execution payload in memcached")
+			api.RespondError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
 	}
 
 	// save this builder's latest bid
