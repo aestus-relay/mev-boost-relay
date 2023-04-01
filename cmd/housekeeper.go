@@ -28,7 +28,8 @@ func init() {
 	housekeeperCmd.Flags().StringVar(&logLevel, "loglevel", defaultLogLevel, "log-level: trace, debug, info, warn/warning, error, fatal, panic")
 
 	housekeeperCmd.Flags().StringSliceVar(&beaconNodeURIs, "beacon-uris", defaultBeaconURIs, "beacon endpoints")
-	housekeeperCmd.Flags().StringVar(&redisURI, "redis-uri", defaultRedisURI, "redis uri")
+	housekeeperCmd.Flags().StringSliceVar(&redisURIs, "redis-uris", []string{""}, "redis uris")
+	housekeeperCmd.Flags().StringVar(&redisPassword, "redis-pw", "", "redis password")
 	housekeeperCmd.Flags().StringVar(&postgresDSN, "db", defaultPostgresDSN, "PostgreSQL DSN")
 
 	housekeeperCmd.Flags().StringVar(&network, "network", defaultNetwork, "Which network to use")
@@ -68,9 +69,9 @@ var housekeeperCmd = &cobra.Command{
 		beaconClient := beaconclient.NewMultiBeaconClient(log, beaconInstances)
 
 		// Connect to Redis and setup the datastore
-		redis, err := datastore.NewRedisCache(networkInfo.Name, redisURI, "")
+		redis, err := datastore.NewRedisCache(networkInfo.Name, redisURIs, redisPassword)
 		if err != nil {
-			log.WithError(err).Fatalf("Failed to connect to Redis at %s", redisURI)
+			log.WithError(err).Fatalf("Failed to connect to Redis at %s", redisURIs)
 		}
 
 		// Connect to Postgres
