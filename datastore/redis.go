@@ -44,34 +44,30 @@ func PubkeyHexToLowerStr(pk boostTypes.PubkeyHex) string {
 	return strings.ToLower(string(pk))
 }
 
-func connectRedis(redisURI string) (*redis.Client, error) {
-	// Handle both URIs and full URLs, assume unencrypted connections
-	if !strings.HasPrefix(redisURI, "redis://") && !strings.HasPrefix(redisURI, "rediss://") {
-		redisURI = "redis://" + redisURI
-	}
-
-	redisOpts, err := redis.ParseURL(redisURI)
-	if err != nil {
-		return nil, err
+func connectRedis(redisURIs []string, redisPassword string) (*redis.ClusterClient, error) {
+	clusterOpt := &redis.ClusterOptions{
+		Addrs:    redisURIs,
+		Password: redisPassword,
+		ReadOnly: true,
 	}
 
 	if redisConnectionPoolSize > 0 {
-		redisOpts.PoolSize = redisConnectionPoolSize
+		clusterOpt.PoolSize = redisConnectionPoolSize
 	}
 	if redisMinIdleConnections > 0 {
-		redisOpts.MinIdleConns = redisMinIdleConnections
+		clusterOpt.MinIdleConns = redisMinIdleConnections
 	}
 	if redisReadTimeoutSec > 0 {
-		redisOpts.ReadTimeout = time.Duration(redisReadTimeoutSec) * time.Second
+		clusterOpt.ReadTimeout = time.Duration(redisReadTimeoutSec) * time.Second
 	}
 	if redisPoolTimeoutSec > 0 {
-		redisOpts.PoolTimeout = time.Duration(redisPoolTimeoutSec) * time.Second
+		clusterOpt.PoolTimeout = time.Duration(redisPoolTimeoutSec) * time.Second
 	}
 	if redisWriteTimeoutSec > 0 {
-		redisOpts.WriteTimeout = time.Duration(redisWriteTimeoutSec) * time.Second
+		clusterOpt.WriteTimeout = time.Duration(redisWriteTimeoutSec) * time.Second
 	}
 
-	redisClient := redis.NewClient(redisOpts)
+	redisClient := redis.NewClusterClient(clusterOpt)
 	if _, err := redisClient.Ping(context.Background()).Result(); err != nil {
 		// unable to connect to redis
 		return nil, err
@@ -80,8 +76,7 @@ func connectRedis(redisURI string) (*redis.Client, error) {
 }
 
 type RedisCache struct {
-	client         *redis.Client
-	readonlyClient *redis.Client
+	client *redis.ClusterClient
 
 	// prefixes (keys generated with a function)
 	prefixGetHeaderResponse           string
@@ -105,23 +100,15 @@ type RedisCache struct {
 	keyLastHashDelivered  string
 }
 
-func NewRedisCache(prefix, redisURI, readonlyURI string) (*RedisCache, error) {
-	client, err := connectRedis(redisURI)
+func NewRedisCache(prefix string, redisURIs []string, redisPassword string) (*RedisCache, error) {
+	client, err := connectRedis(redisURIs, redisPassword)
+
 	if err != nil {
 		return nil, err
 	}
 
-	roClient := client
-	if readonlyURI != "" {
-		roClient, err = connectRedis(readonlyURI)
-		if err != nil {
-			return nil, err
-		}
-	}
-
 	return &RedisCache{
 		client:         client,
-		readonlyClient: roClient,
 
 		prefixGetHeaderResponse:  fmt.Sprintf("%s/%s:cache-gethead-response", redisPrefix, prefix),
 		prefixExecPayloadCapella: fmt.Sprintf("%s/%s:cache-execpayload-capella", redisPrefix, prefix),
