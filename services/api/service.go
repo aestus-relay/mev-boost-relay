@@ -72,6 +72,7 @@ var (
 	numActiveValidatorProcessors = cli.GetEnvInt("NUM_ACTIVE_VALIDATOR_PROCESSORS", 10)
 	numValidatorRegProcessors    = cli.GetEnvInt("NUM_VALIDATOR_REG_PROCESSORS", 10)
 	timeoutGetPayloadRetryMs     = cli.GetEnvInt("GETPAYLOAD_RETRY_TIMEOUT_MS", 100)
+	getPayloadResponseDelayMs    = cli.GetEnvInt("GETPAYLOAD_DELAY_MS", 1000)
 
 	apiReadTimeoutMs       = cli.GetEnvInt("API_TIMEOUT_READ_MS", 1500)
 	apiReadHeaderTimeoutMs = cli.GetEnvInt("API_TIMEOUT_READHEADER_MS", 600)
@@ -154,7 +155,6 @@ type RelayAPI struct {
 
 	// Feature flags
 	ffForceGetHeader204           bool
-	ffDisableBlockPublishing      bool
 	ffDisableLowPrioBuilders      bool
 	ffDisablePayloadDBStorage     bool // disable storing the execution payloads in the database
 	ffDisableSSEPayloadAttributes bool // instead of SSE, fall back to previous polling withdrawals+prevRandao from our custom Prysm fork
@@ -192,7 +192,11 @@ func NewRelayAPI(opts RelayAPIOpts) (api *RelayAPI, err error) {
 		}
 
 		// If using a secret key, ensure it's the correct one
-		publicKey, err = boostTypes.BlsPublicKeyToPublicKey(bls.PublicKeyFromSecretKey(opts.SecretKey))
+		blsPubkey, err := bls.PublicKeyFromSecretKey(opts.SecretKey)
+		if err != nil {
+			return nil, err
+		}
+		publicKey, err = boostTypes.BlsPublicKeyToPublicKey(blsPubkey)
 		if err != nil {
 			return nil, err
 		}
@@ -232,11 +236,6 @@ func NewRelayAPI(opts RelayAPIOpts) (api *RelayAPI, err error) {
 	if os.Getenv("FORCE_GET_HEADER_204") == "1" {
 		api.log.Warn("env: FORCE_GET_HEADER_204 - forcing getHeader to always return 204")
 		api.ffForceGetHeader204 = true
-	}
-
-	if os.Getenv("DISABLE_BLOCK_PUBLISHING") == "1" {
-		api.log.Warn("env: DISABLE_BLOCK_PUBLISHING - disabling publishing blocks on getPayload")
-		api.ffDisableBlockPublishing = true
 	}
 
 	if os.Getenv("DISABLE_LOWPRIO_BUILDERS") == "1" {
@@ -977,6 +976,18 @@ func (api *RelayAPI) handleGetPayload(w http.ResponseWriter, req *http.Request) 
 		}
 	}
 
+	// Publish the signed beacon block via beacon-node
+	signedBeaconBlock := SignedBlindedBeaconBlockToBeaconBlock(payload, getPayloadResp)
+	code, err := api.beaconClient.PublishBlock(signedBeaconBlock) // errors are logged inside
+	if err != nil {
+		log.WithError(err).WithField("code", code).Error("failed to publish block")
+		api.RespondError(w, http.StatusBadRequest, "failed to publish block")
+		return
+	}
+
+	// give the beacon network some time to propagate the block
+	time.Sleep(time.Duration(getPayloadResponseDelayMs) * time.Millisecond)
+
 	api.RespondOK(w, getPayloadResp)
 	log = log.WithFields(logrus.Fields{
 		"numTx":       getPayloadResp.NumTx(),
@@ -1009,16 +1020,6 @@ func (api *RelayAPI) handleGetPayload(w http.ResponseWriter, req *http.Request) 
 		if err != nil {
 			log.WithError(err).Error("failed to increment builder-stats after getPayload")
 		}
-	}()
-
-	// Publish the signed beacon block via beacon-node
-	go func() {
-		if api.ffDisableBlockPublishing {
-			log.Info("publishing the block is disabled")
-			return
-		}
-		signedBeaconBlock := SignedBlindedBeaconBlockToBeaconBlock(payload, getPayloadResp)
-		_, _ = api.beaconClient.PublishBlock(signedBeaconBlock) // errors are logged inside
 	}()
 }
 
@@ -1380,7 +1381,7 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 	// submits two blocks to the relay concurrently, then the randomness of
 	// network latency will make it impossible to predict which arrives first.
 	// Thus a high bid could unintentionally be overwritten by a low bid that
-	// happend to arrive a few microseconds later. If builders are submitting
+	// happened to arrive a few microseconds later. If builders are submitting
 	// blocks at a frequency where they cannot reliably predict which bid will
 	// arrive at the relay first, they should instead use multiple pubkeys to
 	// avoid uninitentionally overwriting their own bids.
