@@ -72,6 +72,7 @@ var (
 	numActiveValidatorProcessors = cli.GetEnvInt("NUM_ACTIVE_VALIDATOR_PROCESSORS", 10)
 	numValidatorRegProcessors    = cli.GetEnvInt("NUM_VALIDATOR_REG_PROCESSORS", 10)
 	timeoutGetPayloadRetryMs     = cli.GetEnvInt("GETPAYLOAD_RETRY_TIMEOUT_MS", 100)
+	getPayloadRequestCutoffMs    = cli.GetEnvInt("GETPAYLOAD_REQUEST_CUTOFF_MS", 3000)
 	getPayloadResponseDelayMs    = cli.GetEnvInt("GETPAYLOAD_DELAY_MS", 1000)
 
 	apiReadTimeoutMs       = cli.GetEnvInt("API_TIMEOUT_READ_MS", 1500)
@@ -158,6 +159,7 @@ type RelayAPI struct {
 	ffDisableLowPrioBuilders      bool
 	ffDisablePayloadDBStorage     bool // disable storing the execution payloads in the database
 	ffDisableSSEPayloadAttributes bool // instead of SSE, fall back to previous polling withdrawals+prevRandao from our custom Prysm fork
+	ffAllowMemcacheSavingFail     bool // don't fail when saving payloads to memcache doesn't succeed
 
 	latestParentBlockHash uberatomic.String // used to cache the latest parent block hash, to avoid repetitive similar SSE events
 
@@ -251,6 +253,11 @@ func NewRelayAPI(opts RelayAPIOpts) (api *RelayAPI, err error) {
 	if os.Getenv("DISABLE_SSE_PAYLOAD_ATTRIBUTES") == "1" {
 		api.log.Warn("env: DISABLE_SSE_PAYLOAD_ATTRIBUTES - using previous polling logic for withdrawals and randao (requires custom Prysm fork)")
 		api.ffDisableSSEPayloadAttributes = true
+	}
+
+	if os.Getenv("MEMCACHE_ALLOW_SAVING_FAIL") == "1" {
+		api.log.Warn("env: MEMCACHE_ALLOW_SAVING_FAIL - continue block submission request even if saving to memcache fails")
+		api.ffAllowMemcacheSavingFail = true
 	}
 
 	return api, nil
@@ -921,8 +928,10 @@ func (api *RelayAPI) handleGetPayload(w http.ResponseWriter, req *http.Request) 
 		"idArg":     req.URL.Query().Get("id"),
 	})
 
-	log.Debug("getPayload request received")
+	// Snapshot current time
+	requestTime := time.Now().UTC()
 
+	// Start with signature validation
 	proposerPubkey, found := api.datastore.GetKnownValidatorPubkeyByIndex(payload.ProposerIndex())
 	if !found {
 		log.Errorf("could not find proposer pubkey for index %d", payload.ProposerIndex())
@@ -930,7 +939,7 @@ func (api *RelayAPI) handleGetPayload(w http.ResponseWriter, req *http.Request) 
 		return
 	}
 
-	log = log.WithField("pubkeyFromIndex", proposerPubkey)
+	log = log.WithField("proposerPubkey", proposerPubkey)
 
 	// Get the proposer pubkey based on the validator index from the payload
 	pk, err := boostTypes.HexToPubkey(proposerPubkey.String())
@@ -953,8 +962,15 @@ func (api *RelayAPI) handleGetPayload(w http.ResponseWriter, req *http.Request) 
 		}
 	}
 
-	// Once the signature is verified, we know the proposer is committed to this bid.
-	signedAt := time.Now().UTC()
+	// Only allow getPayload requests for the current slot until a certain cutoff time (2 sec into the slot)
+	slotStartMs := (api.genesisInfo.Data.GenesisTime + (payload.Slot() * 12)) * 1000
+	msIntoSlot := uint64(requestTime.UnixMilli()) - slotStartMs
+	log.WithField("msIntoSlot", msIntoSlot).Info("getPayload request received")
+	if msIntoSlot > uint64(getPayloadRequestCutoffMs) {
+		log.WithField("msIntoSlot", msIntoSlot).Error("getPayload sent too late")
+		api.RespondError(w, http.StatusBadRequest, "sent too late")
+		return
+	}
 
 	// Get the response - from memory, Redis or DB
 	// note that mev-boost might send getPayload for bids of other relays, thus this code wouldn't find anything
@@ -1007,7 +1023,7 @@ func (api *RelayAPI) handleGetPayload(w http.ResponseWriter, req *http.Request) 
 			log.WithError(err).Error("failed to get bidTrace for delivered payload from redis")
 		}
 
-		err = api.db.SaveDeliveredPayload(bidTrace, payload, signedAt)
+		err = api.db.SaveDeliveredPayload(bidTrace, payload, requestTime)
 		if err != nil {
 			log.WithError(err).WithFields(logrus.Fields{
 				"bidTrace": bidTrace,
@@ -1439,8 +1455,10 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 		err = api.memcached.SaveExecutionPayload(payload.Slot(), payload.ProposerPubkey(), payload.BlockHash(), getPayloadResponse)
 		if err != nil {
 			log.WithError(err).Error("failed saving execution payload in memcached")
-			api.RespondError(w, http.StatusInternalServerError, err.Error())
-			return
+			if !api.ffAllowMemcacheSavingFail {
+				api.RespondError(w, http.StatusInternalServerError, err.Error())
+				return
+			}
 		}
 	}
 
