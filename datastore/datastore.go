@@ -56,21 +56,21 @@ func NewDatastore(log *logrus.Entry, redisCache *RedisCache, memcached *Memcache
 
 // RefreshKnownValidators loads known validators from Redis into memory
 func (ds *Datastore) RefreshKnownValidators() (cnt int, err error) {
-	knownValidators, err := ds.redis.GetKnownValidators()
+	knownValidatorsByIndex, err := ds.redis.GetKnownValidators()
 	if err != nil {
 		return 0, err
 	}
 
-	knownValidatorsByIndex := make(map[uint64]types.PubkeyHex)
-	for pubkey, index := range knownValidators {
-		knownValidatorsByIndex[index] = pubkey
+	knownValidatorsByPubkey := make(map[types.PubkeyHex]uint64)
+	for index, pubkey := range knownValidatorsByIndex {
+		knownValidatorsByPubkey[pubkey] = index
 	}
 
 	ds.knownValidatorsLock.Lock()
 	defer ds.knownValidatorsLock.Unlock()
-	ds.knownValidatorsByPubkey = knownValidators
+	ds.knownValidatorsByPubkey = knownValidatorsByPubkey
 	ds.knownValidatorsByIndex = knownValidatorsByIndex
-	return len(knownValidators), nil
+	return len(knownValidatorsByIndex), nil
 }
 
 func (ds *Datastore) IsKnownValidator(pubkeyHex types.PubkeyHex) bool {
@@ -123,7 +123,7 @@ func (ds *Datastore) GetGetPayloadResponse(slot uint64, proposerPubkey, blockHas
 	// 1. try to get from Redis
 	resp, err := ds.redis.GetExecutionPayload(slot, _proposerPubkey, _blockHash)
 	if err != nil {
-		ds.log.WithError(err).Error("error getting getPayload response from redis")
+		ds.log.WithError(err).Error("error getting execution payload from redis")
 	} else {
 		ds.log.Debug("getPayload response from redis")
 		return resp, nil
@@ -133,7 +133,7 @@ func (ds *Datastore) GetGetPayloadResponse(slot uint64, proposerPubkey, blockHas
 	if ds.memcached != nil {
 		resp, err = ds.memcached.GetExecutionPayload(slot, _proposerPubkey, _blockHash)
 		if err != nil {
-			ds.log.WithError(err).Error("error getting execution payload response from memcached")
+			ds.log.WithError(err).Error("error getting execution payload from memcached")
 		} else if resp != nil {
 			ds.log.Debug("getPayload response from memcached")
 			return resp, nil
@@ -143,7 +143,7 @@ func (ds *Datastore) GetGetPayloadResponse(slot uint64, proposerPubkey, blockHas
 	// 3. try to get from database (should not happen, it's just a backup)
 	executionPayloadEntry, err := ds.db.GetExecutionPayloadEntryBySlotPkHash(slot, proposerPubkey, blockHash)
 	if err != nil {
-		ds.log.WithError(err).Error("error getting execution payload response from database")
+		ds.log.WithError(err).Error("error getting execution payload from database")
 		return nil, err
 	}
 
