@@ -28,7 +28,7 @@ func (db MockDB) GetLatestValidatorRegistrations(timestampOnly bool) ([]*Validat
 	return nil, nil
 }
 
-func (db MockDB) SaveBuilderBlockSubmission(payload *common.BuilderSubmitBlockRequest, simError error, receivedAt, eligibleAt time.Time, saveExecPayload bool) (entry *BuilderBlockSubmissionEntry, err error) {
+func (db MockDB) SaveBuilderBlockSubmission(payload *common.BuilderSubmitBlockRequest, requestError, validationError error, receivedAt, eligibleAt time.Time, wasSimulated, saveExecPayload bool) (entry *BuilderBlockSubmissionEntry, err error) {
 	return nil, nil
 }
 
@@ -72,7 +72,7 @@ func (db MockDB) GetBuilderSubmissionsBySlots(slotFrom, slotTo uint64) (entries 
 	return nil, nil
 }
 
-func (db MockDB) SaveDeliveredPayload(bidTrace *common.BidTraceV2, signedBlindedBeaconBlock *common.SignedBlindedBeaconBlock, signedAt time.Time) error {
+func (db MockDB) SaveDeliveredPayload(bidTrace *common.BidTraceV2, signedBlindedBeaconBlock *common.SignedBlindedBeaconBlock, signedAt time.Time, publishMs uint64) error {
 	return nil
 }
 
@@ -97,5 +97,13 @@ func (db MockDB) IncBlockBuilderStatsAfterGetHeader(slot uint64, blockhash strin
 }
 
 func (db MockDB) IncBlockBuilderStatsAfterGetPayload(builderPubkey string) error {
+	return nil
+}
+
+func (db MockDB) GetTooLateGetPayload(slot uint64) (entries []*TooLateGetPayloadEntry, err error) {
+	return nil, nil
+}
+
+func (db MockDB) InsertTooLateGetPayload(slot uint64, proposerPubkey, blockHash string, slotStart, requestTime, decodeTime, msIntoSlot uint64) error {
 	return nil
 }

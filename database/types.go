@@ -133,8 +133,10 @@ type BuilderBlockSubmissionEntry struct {
 	ExecutionPayloadID sql.NullInt64 `db:"execution_payload_id"`
 
 	// Sim Result
-	SimSuccess bool   `db:"sim_success"`
-	SimError   string `db:"sim_error"`
+	WasSimulated bool   `db:"was_simulated"`
+	SimSuccess   bool   `db:"sim_success"`
+	SimError     string `db:"sim_error"`
+	SimReqError  string `db:"sim_req_error"`
 
 	// BidTrace data
 	Signature string `db:"signature"`
@@ -181,6 +183,8 @@ type DeliveredPayloadEntry struct {
 
 	NumTx uint64 `db:"num_tx"`
 	Value string `db:"value"`
+
+	PublishMs uint64 `db:"publish_ms"`
 }
 
 type BlockBuilderEntry struct {
@@ -200,4 +204,19 @@ type BlockBuilderEntry struct {
 	NumSubmissionsSimError uint64 `db:"num_submissions_simerror" json:"num_submissions_simerror"`
 
 	NumSentGetPayload uint64 `db:"num_sent_getpayload" json:"num_sent_getpayload"`
+}
+
+type TooLateGetPayloadEntry struct {
+	ID         int64     `db:"id"`
+	InsertedAt time.Time `db:"inserted_at"`
+
+	Slot uint64 `db:"slot"`
+
+	SlotStartTimestamp uint64 `db:"slot_start_timestamp"`
+	RequestTimestamp   uint64 `db:"request_timestamp"`
+	DecodeTimestamp    uint64 `db:"decode_timestamp"`
+
+	ProposerPubkey string `db:"proposer_pubkey"`
+	BlockHash      string `db:"block_hash"`
+	MsIntoSlot     uint64 `db:"ms_into_slot"`
 }

@@ -149,13 +149,16 @@ redis-cli DEL boost-relay/sepolia:validators-registration boost-relay/sepolia:va
 * `MEMCACHED_MAX_IDLE_CONNS` - client max idle conns (default: 10)
 * `NUM_ACTIVE_VALIDATOR_PROCESSORS` - proposer API - number of goroutines to listen to the active validators channel
 * `NUM_VALIDATOR_REG_PROCESSORS` - proposer API - number of goroutines to listen to the validator registration channel
+* `NO_HEADER_USERAGENTS` - proposer API - comma separated list of user agents for which no bids should be returned
+* `ENABLE_BUILDER_CANCELLATIONS` - whether to enable block builder cancellations
+* `REDIS_URI` - main redis URI (default: `localhost:6379`)
+* `REDIS_READONLY_URI` - optional, a secondary redis instance for heavy read operations
 
 #### Feature Flags
 
 * `DISABLE_PAYLOAD_DATABASE_STORAGE` - builder API - disable storing execution payloads in the database (i.e. when using memcached as data availability redundancy)
 * `DISABLE_LOWPRIO_BUILDERS` - reject block submissions by low-prio builders
 * `FORCE_GET_HEADER_204` - force 204 as getHeader response
-* `MEMCACHE_ALLOW_SAVING_FAIL` -- don't abort builder submission if memcache saving fails
 
 #### Development Environment Variables
 
@@ -342,13 +345,19 @@ ExecStart=/home/ubuntu/prysm/bazel-bin/cmd/beacon-chain/beacon-chain_/beacon-cha
         --execution-endpoint=http://localhost:8551 \
         --jwt-secret=/var/lib/goethereum/jwtsecret \
         --min-sync-peers=1 \
-        --grpc-max-msg-size 104857600
+        --grpc-max-msg-size 104857600 \
+        --prepare-all-payloads \
+        --disable-reorg-late-blocks
 
 [Install]
 WantedBy=default.target
 ```
 
 </details>
+
+## Bid Cancellations
+
+Block builders can opt into cancellations by submitting blocks to `/relay/v1/builder/blocks?cancellations=1`. This may incur a performance penalty (i.e. validation of submissions taking significantly longer). See also https://github.com/flashbots/mev-boost-relay/issues/348
 
 ---
 
