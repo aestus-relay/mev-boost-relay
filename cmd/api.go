@@ -24,13 +24,14 @@ var (
 	apiDefaultSecretKey  = common.GetEnv("SECRET_KEY", "")
 	apiDefaultLogTag     = os.Getenv("LOG_TAG")
 
+	apiDefaultAPIs               = strings.Split(common.GetEnv("APIS", "proposer,builder,data"), ",")
 	apiDefaultPprofEnabled       = os.Getenv("PPROF") == "1"
 	apiDefaultInternalAPIEnabled = os.Getenv("ENABLE_INTERNAL_API") == "1"
 
-	// Default Builder, Data, and Proposer API as true.
-	apiDefaultBuilderAPIEnabled  = os.Getenv("DISABLE_BUILDER_API") != "1"
-	apiDefaultDataAPIEnabled     = os.Getenv("DISABLE_DATA_API") != "1"
-	apiDefaultProposerAPIEnabled = os.Getenv("DISABLE_PROPOSER_API") != "1"
+	// Default Builder, Data, and Proposer API as false.
+	apiDefaultBuilderAPIEnabled  = os.Getenv("ENABLE_BUILDER_API") == "1"
+	apiDefaultDataAPIEnabled     = os.Getenv("ENABLE_DATA_API") == "1"
+	apiDefaultProposerAPIEnabled = os.Getenv("ENABLE_PROPOSER_API") == "1"
 
 	apiListenAddr   string
 	apiPprofEnabled bool
@@ -62,6 +63,7 @@ func init() {
 	apiCmd.Flags().StringVar(&apiBlockSimURL, "blocksim", apiDefaultBlockSim, "URL for block simulator")
 	apiCmd.Flags().StringVar(&network, "network", defaultNetwork, "Which network to use")
 
+	apiCmd.Flags().StringSliceVar(&enabledAPIs, "apis", apiDefaultAPIs, "APIs to enable")
 	apiCmd.Flags().BoolVar(&apiPprofEnabled, "pprof", apiDefaultPprofEnabled, "enable pprof API")
 	apiCmd.Flags().BoolVar(&apiBuilderAPI, "builder-api", apiDefaultBuilderAPIEnabled, "enable builder API (/builder/...)")
 	apiCmd.Flags().BoolVar(&apiDataAPI, "data-api", apiDefaultDataAPIEnabled, "enable data API (/data/...)")
@@ -160,6 +162,24 @@ var apiCmd = &cobra.Command{
 			InternalAPI:     apiInternalAPI,
 			ProposerAPI:     apiProposerAPI,
 			PprofAPI:        apiPprofEnabled,
+		}
+
+		// Update APIs from enabled list
+		for _, name := range enabledAPIs {
+			switch name {
+			case "proposer":
+				opts.ProposerAPI = true
+			case "builder":
+				opts.BlockBuilderAPI = true
+			case "data":
+				opts.DataAPI = true
+			case "internal":
+				opts.InternalAPI = true
+			case "pprof":
+				opts.PprofAPI = true
+			default:
+				log.Fatalf("API " + name + " not recognized")
+			}
 		}
 
 		// Decode the private key
