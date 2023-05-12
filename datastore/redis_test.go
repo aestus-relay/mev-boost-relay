@@ -9,9 +9,13 @@ import (
 	"time"
 
 	"github.com/alicebob/miniredis/v2"
+	"github.com/attestantio/go-builder-client/api/capella"
+	"github.com/attestantio/go-builder-client/spec"
+	consensusspec "github.com/attestantio/go-eth2-client/spec"
 	"github.com/flashbots/go-boost-utils/types"
 	"github.com/flashbots/mev-boost-relay/common"
 	"github.com/go-redis/redis/v9"
+	"github.com/holiman/uint256"
 	"github.com/stretchr/testify/require"
 )
 
@@ -199,7 +203,7 @@ func TestBuilderBids(t *testing.T) {
 	cache := setupTestRedis(t)
 
 	// Helper to ensure writing to redis worked as expected
-	ensureBestBidValueEquals := func(expectedValue int64) {
+	ensureBestBidValueEquals := func(expectedValue int64, builderPubkey string) {
 		bestBid, err := cache.GetBestBid(slot, parentHash, proposerPubkey)
 		require.NoError(t, err)
 		require.Equal(t, big.NewInt(expectedValue), bestBid.Value())
@@ -207,6 +211,10 @@ func TestBuilderBids(t *testing.T) {
 		topBidValue, err := cache.GetTopBidValue(slot, parentHash, proposerPubkey)
 		require.NoError(t, err)
 		require.Equal(t, big.NewInt(expectedValue), topBidValue)
+
+		latestBidValue, err := cache.GetBuilderLatestValue(slot, parentHash, proposerPubkey, builderPubkey)
+		require.NoError(t, err)
+		require.Equal(t, big.NewInt(expectedValue), latestBidValue)
 	}
 
 	// submit ba1=10
@@ -218,7 +226,7 @@ func TestBuilderBids(t *testing.T) {
 	require.True(t, resp.IsNewTopBid)
 	require.Equal(t, big.NewInt(10), resp.TopBidValue)
 	require.Equal(t, bApubkey, resp.TopBidBuilder)
-	ensureBestBidValueEquals(10)
+	ensureBestBidValueEquals(10, bApubkey)
 
 	// submit ba2=5 (should not update)
 	payload, getPayloadResp, getHeaderResp = common.CreateTestBlockSubmission(t, bApubkey, big.NewInt(5), &opts)
@@ -229,7 +237,7 @@ func TestBuilderBids(t *testing.T) {
 	require.False(t, resp.IsNewTopBid)
 	require.Equal(t, big.NewInt(10), resp.TopBidValue)
 	require.Equal(t, bApubkey, resp.TopBidBuilder)
-	ensureBestBidValueEquals(10)
+	ensureBestBidValueEquals(10, bApubkey)
 
 	// submit ba3c=5 (should update, because of cancellation)
 	payload, getPayloadResp, getHeaderResp = common.CreateTestBlockSubmission(t, bApubkey, big.NewInt(5), &opts)
@@ -241,7 +249,7 @@ func TestBuilderBids(t *testing.T) {
 	require.Equal(t, big.NewInt(5), resp.TopBidValue)
 	require.Equal(t, bApubkey, resp.TopBidBuilder)
 	require.Equal(t, big.NewInt(10), resp.PrevTopBidValue)
-	ensureBestBidValueEquals(5)
+	ensureBestBidValueEquals(5, bApubkey)
 
 	// submit bb1=20
 	payload, getPayloadResp, getHeaderResp = common.CreateTestBlockSubmission(t, bBpubkey, big.NewInt(20), &opts)
@@ -252,7 +260,7 @@ func TestBuilderBids(t *testing.T) {
 	require.True(t, resp.IsNewTopBid)
 	require.Equal(t, big.NewInt(20), resp.TopBidValue)
 	require.Equal(t, bBpubkey, resp.TopBidBuilder)
-	ensureBestBidValueEquals(20)
+	ensureBestBidValueEquals(20, bBpubkey)
 
 	// submit ba4c=3
 	payload, getPayloadResp, getHeaderResp = common.CreateTestBlockSubmission(t, bApubkey, big.NewInt(5), &opts)
@@ -263,7 +271,7 @@ func TestBuilderBids(t *testing.T) {
 	require.False(t, resp.IsNewTopBid)
 	require.Equal(t, big.NewInt(20), resp.TopBidValue)
 	require.Equal(t, bBpubkey, resp.TopBidBuilder)
-	ensureBestBidValueEquals(20)
+	ensureBestBidValueEquals(20, bBpubkey)
 
 	// submit bb2c=2 (cancels prev top bid bb1)
 	payload, getPayloadResp, getHeaderResp = common.CreateTestBlockSubmission(t, bBpubkey, big.NewInt(2), &opts)
@@ -274,7 +282,7 @@ func TestBuilderBids(t *testing.T) {
 	require.False(t, resp.IsNewTopBid)
 	require.Equal(t, big.NewInt(5), resp.TopBidValue)
 	require.Equal(t, bApubkey, resp.TopBidBuilder)
-	ensureBestBidValueEquals(5)
+	ensureBestBidValueEquals(5, bApubkey)
 }
 
 func TestRedisURIs(t *testing.T) {
@@ -307,9 +315,10 @@ func TestRedisURIs(t *testing.T) {
 	require.Error(t, err)
 }
 
-func TestCheckAndSetLastSlotDelivered(t *testing.T) {
+func TestCheckAndSetLastSlotAndHashDelivered(t *testing.T) {
 	cache := setupTestRedis(t)
 	newSlot := uint64(123)
+	newHash := "0x0000000000000000000000000000000000000000000000000000000000000000"
 
 	// should return redis.Nil if wasn't set
 	slot, err := cache.GetLastSlotDelivered()
@@ -317,7 +326,7 @@ func TestCheckAndSetLastSlotDelivered(t *testing.T) {
 	require.Equal(t, uint64(0), slot)
 
 	// should be able to set once
-	err = cache.CheckAndSetLastSlotDelivered(newSlot)
+	err = cache.CheckAndSetLastSlotAndHashDelivered(newSlot, newHash)
 	require.NoError(t, err)
 
 	// should get slot
@@ -325,20 +334,31 @@ func TestCheckAndSetLastSlotDelivered(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, newSlot, slot)
 
-	// should fail on second time
-	err = cache.CheckAndSetLastSlotDelivered(newSlot)
-	require.ErrorIs(t, err, ErrSlotAlreadyDelivered)
+	// should get hash
+	hash, err := cache.GetLastHashDelivered()
+	require.NoError(t, err)
+	require.Equal(t, newHash, hash)
+
+	// should fail on a different payload (mismatch block hash)
+	differentHash := "0x0000000000000000000000000000000000000000000000000000000000000001"
+	err = cache.CheckAndSetLastSlotAndHashDelivered(newSlot, differentHash)
+	require.ErrorIs(t, err, ErrAnotherPayloadAlreadyDeliveredForSlot)
+
+	// should not return error for same hash
+	err = cache.CheckAndSetLastSlotAndHashDelivered(newSlot, newHash)
+	require.NoError(t, err)
 
 	// should also fail on earlier slots
-	err = cache.CheckAndSetLastSlotDelivered(newSlot - 1)
-	require.ErrorIs(t, err, ErrSlotAlreadyDelivered)
+	err = cache.CheckAndSetLastSlotAndHashDelivered(newSlot-1, newHash)
+	require.ErrorIs(t, err, ErrPastSlotAlreadyDelivered)
 }
 
-// Test_CheckAndSetLastSlotDeliveredForTesting ensures the optimistic locking works
-// i.e. running CheckAndSetLastSlotDelivered leading to err == redis.TxFailedErr
-func Test_CheckAndSetLastSlotDeliveredForTesting(t *testing.T) {
+// Test_CheckAndSetLastSlotAndHashDeliveredForTesting ensures the optimistic locking works
+// i.e. running CheckAndSetLastSlotAndHashDelivered leading to err == redis.TxFailedErr
+func Test_CheckAndSetLastSlotAndHashDeliveredForTesting(t *testing.T) {
 	cache := setupTestRedis(t)
 	newSlot := uint64(123)
+	hash := "0x0000000000000000000000000000000000000000000000000000000000000000"
 	n := 3
 
 	errC := make(chan error, n)
@@ -349,7 +369,7 @@ func Test_CheckAndSetLastSlotDeliveredForTesting(t *testing.T) {
 	for i := 0; i < n; i++ {
 		syncWG.Add(1)
 		go func() {
-			errC <- _CheckAndSetLastSlotDeliveredForTesting(cache, waitC, &syncWG, newSlot)
+			errC <- _CheckAndSetLastSlotAndHashDeliveredForTesting(cache, waitC, &syncWG, newSlot, hash)
 		}()
 	}
 
@@ -367,13 +387,14 @@ func Test_CheckAndSetLastSlotDeliveredForTesting(t *testing.T) {
 		require.ErrorIs(t, err, redis.TxFailedErr)
 	}
 
-	// Any later call should return ErrSlotAlreadyDelivered
-	err = _CheckAndSetLastSlotDeliveredForTesting(cache, waitC, &syncWG, newSlot)
+	// Any later call with a different hash should return ErrPayloadAlreadyDeliveredForSlot
+	differentHash := "0x0000000000000000000000000000000000000000000000000000000000000001"
+	err = _CheckAndSetLastSlotAndHashDeliveredForTesting(cache, waitC, &syncWG, newSlot, differentHash)
 	waitC <- true
-	require.ErrorIs(t, err, ErrSlotAlreadyDelivered)
+	require.ErrorIs(t, err, ErrAnotherPayloadAlreadyDeliveredForSlot)
 }
 
-func _CheckAndSetLastSlotDeliveredForTesting(r *RedisCache, waitC chan bool, wg *sync.WaitGroup, slot uint64) (err error) {
+func _CheckAndSetLastSlotAndHashDeliveredForTesting(r *RedisCache, waitC chan bool, wg *sync.WaitGroup, slot uint64, hash string) (err error) {
 	// copied from redis.go, with added channel and waitgroup to test the race condition in a controlled way
 	txf := func(tx *redis.Tx) error {
 		lastSlotDelivered, err := tx.Get(context.Background(), r.keyLastSlotDelivered).Uint64()
@@ -381,8 +402,19 @@ func _CheckAndSetLastSlotDeliveredForTesting(r *RedisCache, waitC chan bool, wg 
 			return err
 		}
 
-		if slot <= lastSlotDelivered {
-			return ErrSlotAlreadyDelivered
+		if slot < lastSlotDelivered {
+			return ErrPastSlotAlreadyDelivered
+		}
+
+		if slot == lastSlotDelivered {
+			lastHashDelivered, err := tx.Get(context.Background(), r.keyLastHashDelivered).Result()
+			if err != nil && !errors.Is(err, redis.Nil) {
+				return err
+			}
+			if hash != lastHashDelivered {
+				return ErrAnotherPayloadAlreadyDeliveredForSlot
+			}
+			return nil
 		}
 
 		wg.Done()
@@ -390,6 +422,7 @@ func _CheckAndSetLastSlotDeliveredForTesting(r *RedisCache, waitC chan bool, wg 
 
 		_, err = tx.TxPipelined(context.Background(), func(pipe redis.Pipeliner) error {
 			pipe.Set(context.Background(), r.keyLastSlotDelivered, slot, 0)
+			pipe.Set(context.Background(), r.keyLastHashDelivered, hash, 0)
 			return nil
 		})
 
@@ -397,4 +430,39 @@ func _CheckAndSetLastSlotDeliveredForTesting(r *RedisCache, waitC chan bool, wg 
 	}
 
 	return r.client.Watch(context.Background(), txf, r.keyLastSlotDelivered)
+}
+
+func TestGetBuilderLatestValue(t *testing.T) {
+	cache := setupTestRedis(t)
+
+	slot := uint64(123)
+	parentHash := "0x13e606c7b3d1faad7e83503ce3dedce4c6bb89b0c28ffb240d713c7b110b9747"
+	proposerPubkey := "0x6ae5932d1e248d987d51b58665b81848814202d7b23b343d20f2a167d12f07dcb01ca41c42fdd60b7fca9c4b90890792"
+	builderPubkey := "0xfa1ed37c3553d0ce1e9349b2c5063cf6e394d231c8d3e0df75e9462257c081543086109ffddaacc0aa76f33dc9661c83"
+
+	// With no bids, should return "0".
+	v, err := cache.GetBuilderLatestValue(slot, parentHash, proposerPubkey, builderPubkey)
+	require.NoError(t, err)
+	require.Equal(t, v.Text(10), "0")
+
+	// Set a bid of 1 ETH.
+	newVal, err := uint256.FromDecimal("1000000000000000000")
+	require.NoError(t, err)
+	getHeaderResp := &common.GetHeaderResponse{
+		Capella: &spec.VersionedSignedBuilderBid{
+			Version: consensusspec.DataVersionCapella,
+			Capella: &capella.SignedBuilderBid{
+				Message: &capella.BuilderBid{
+					Value: newVal,
+				},
+			},
+		},
+	}
+	err = cache.SaveBuilderBid(slot, parentHash, proposerPubkey, builderPubkey, time.Now().UTC(), getHeaderResp)
+	require.NoError(t, err)
+
+	// Check new string.
+	v, err = cache.GetBuilderLatestValue(slot, parentHash, proposerPubkey, builderPubkey)
+	require.NoError(t, err)
+	require.Zero(t, v.Cmp(newVal.ToBig()))
 }

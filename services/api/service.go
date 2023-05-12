@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/NYTimes/gziphandler"
+	builderCapella "github.com/attestantio/go-builder-client/api/capella"
 	"github.com/attestantio/go-eth2-client/api/v1/capella"
 	"github.com/attestantio/go-eth2-client/spec/phase0"
 	"github.com/buger/jsonparser"
@@ -37,6 +38,12 @@ import (
 	"github.com/sirupsen/logrus"
 	uberatomic "go.uber.org/atomic"
 	"golang.org/x/exp/slices"
+)
+
+const (
+	ErrBlockAlreadyKnown  = "simulation failed: block already known"
+	ErrBlockRequiresReorg = "simulation failed: block requires a reorg"
+	ErrMissingTrieNode    = "missing trie node"
 )
 
 var (
@@ -67,7 +74,8 @@ var (
 	pathDataValidatorRegistration    = "/relay/v1/data/validator_registration"
 
 	// Internal API
-	pathInternalBuilderStatus = "/internal/v1/builder/{pubkey:0x[a-fA-F0-9]+}"
+	pathInternalBuilderStatus     = "/internal/v1/builder/{pubkey:0x[a-fA-F0-9]+}"
+	pathInternalBuilderCollateral = "/internal/v1/builder/collateral/{pubkey:0x[a-fA-F0-9]+}"
 
 	// number of goroutines to save active validator
 	numActiveValidatorProcessors = cli.GetEnvInt("NUM_ACTIVE_VALIDATOR_PROCESSORS", 10)
@@ -124,6 +132,20 @@ type payloadAttributesHelper struct {
 	payloadAttributes beaconclient.PayloadAttributes
 }
 
+// Data needed to issue a block validation request.
+type blockSimOptions struct {
+	isHighPrio bool
+	fastTrack  bool
+	log        *logrus.Entry
+	builder    *blockBuilderCacheEntry
+	req        *common.BuilderBlockValidationRequest
+}
+
+type blockBuilderCacheEntry struct {
+	status     common.BuilderStatus
+	collateral *big.Int
+}
+
 // RelayAPI represents a single Relay instance
 type RelayAPI struct {
 	opts RelayAPIOpts
@@ -152,7 +174,7 @@ type RelayAPI struct {
 	proposerDutiesSlot       uint64
 	isUpdatingProposerDuties uberatomic.Bool
 
-	blockSimRateLimiter *BlockSimulationRateLimiter
+	blockSimRateLimiter IBlockSimRateLimiter
 
 	activeValidatorC chan boostTypes.PubkeyHex
 	validatorRegC    chan boostTypes.SignedValidatorRegistration
@@ -170,6 +192,15 @@ type RelayAPI struct {
 
 	payloadAttributes     map[string]payloadAttributesHelper // key:parentBlockHash
 	payloadAttributesLock sync.RWMutex
+
+	// The slot we are currently optimistically simulating.
+	optimisticSlot uberatomic.Uint64
+	// The number of optimistic blocks being processed (only used for logging).
+	optimisticBlocksInFlight uberatomic.Uint64
+	// Wait group used to monitor status of per-slot optimistic processing.
+	optimisticBlocksWG sync.WaitGroup
+	// Cache for builder statuses and collaterals.
+	blockBuildersCache map[string]*blockBuilderCacheEntry
 }
 
 // NewRelayAPI creates a new service. if builders is nil, allow any builder
@@ -310,6 +341,7 @@ func (api *RelayAPI) getRouter() http.Handler {
 	if api.opts.InternalAPI {
 		api.log.Info("internal API enabled")
 		r.HandleFunc(pathInternalBuilderStatus, api.handleInternalBuilderStatus).Methods(http.MethodGet, http.MethodPost, http.MethodPut)
+		r.HandleFunc(pathInternalBuilderCollateral, api.handleInternalBuilderCollateral).Methods(http.MethodPost, http.MethodPut)
 	}
 
 	// r.Use(mux.CORSMethodMiddleware(r))
@@ -341,6 +373,9 @@ func (api *RelayAPI) StartServer() (err error) {
 	if err != nil {
 		return err
 	}
+
+	// Initialize block builder cache.
+	api.blockBuildersCache = make(map[string]*blockBuilderCacheEntry)
 
 	// Helpers
 	currentSlot := bestSyncStatus.HeadSlot
@@ -493,6 +528,86 @@ func (api *RelayAPI) startValidatorRegistrationDBProcessor() {
 	}
 }
 
+// simulateBlock sends a request for a block simulation to blockSimRateLimiter.
+func (api *RelayAPI) simulateBlock(ctx context.Context, opts blockSimOptions) (requestErr, validationErr error) {
+	t := time.Now()
+	requestErr, validationErr = api.blockSimRateLimiter.Send(ctx, opts.req, opts.isHighPrio, opts.fastTrack)
+	log := opts.log.WithFields(logrus.Fields{
+		"duration":   time.Since(t).Seconds(),
+		"numWaiting": api.blockSimRateLimiter.CurrentCounter(),
+	})
+	if validationErr != nil {
+		// TODO(mikeneuder): consider the negation logic here if it improves readability.
+		ignoreError := validationErr.Error() == ErrBlockAlreadyKnown || validationErr.Error() == ErrBlockRequiresReorg || strings.Contains(validationErr.Error(), ErrMissingTrieNode)
+		if !ignoreError {
+			log.WithError(validationErr).Warn("block validation failed")
+			return nil, validationErr
+		}
+		log.WithError(validationErr).Warn("block validation failed with ignorable error")
+		return nil, nil
+	}
+	if requestErr != nil {
+		log.WithError(requestErr).Warn("block validation failed: request error")
+		return requestErr, nil
+	}
+	log.Info("block validation successful")
+	return nil, nil
+}
+
+func (api *RelayAPI) demoteBuilder(pubkey string, req *common.BuilderSubmitBlockRequest, simError error) {
+	builderEntry, ok := api.blockBuildersCache[pubkey]
+	if !ok {
+		api.log.Warnf("builder %v not in the builder cache", pubkey)
+		builderEntry = &blockBuilderCacheEntry{} //nolint:exhaustruct
+	}
+	newStatus := common.BuilderStatus{
+		IsHighPrio:    builderEntry.status.IsHighPrio,
+		IsBlacklisted: builderEntry.status.IsBlacklisted,
+		IsOptimistic:  false,
+	}
+	api.log.Infof("demoted builder, new status: %v", newStatus)
+	if err := api.db.SetBlockBuilderIDStatusIsOptimistic(pubkey, false); err != nil {
+		api.log.Error(fmt.Errorf("error setting builder: %v status: %w", pubkey, err))
+	}
+	// Write to demotions table.
+	api.log.WithFields(logrus.Fields{"builder_pubkey": pubkey}).Info("demoting builder")
+	if err := api.db.InsertBuilderDemotion(req, simError); err != nil {
+		api.log.WithError(err).WithFields(logrus.Fields{
+			"errorWritingDemotionToDB": true,
+			"bidTrace":                 req.Message,
+			"simError":                 simError,
+		}).Error("failed to save demotion to database")
+	}
+}
+
+// processOptimisticBlock is called on a new goroutine when a optimistic block
+// needs to be simulated.
+func (api *RelayAPI) processOptimisticBlock(opts blockSimOptions) {
+	api.optimisticBlocksInFlight.Add(1)
+	defer func() { api.optimisticBlocksInFlight.Sub(1) }()
+	api.optimisticBlocksWG.Add(1)
+	defer api.optimisticBlocksWG.Done()
+
+	ctx := context.Background()
+	builderPubkey := opts.req.BuilderPubkey().String()
+	opts.log.WithFields(logrus.Fields{
+		"builderPubkey": builderPubkey,
+		// NOTE: this value is just an estimate because many goroutines could be
+		// updating api.optimisticBlocksInFlight concurrently. Since we just use
+		// it for logging, it is not atomic to avoid the performance impact.
+		"optBlocksInFlight": api.optimisticBlocksInFlight,
+	}).Infof("simulating optimistic block with hash: %v", opts.req.BuilderSubmitBlockRequest.BlockHash())
+	reqErr, simErr := api.simulateBlock(ctx, opts)
+	if reqErr != nil || simErr != nil {
+		// Mark builder as non-optimistic.
+		opts.builder.status.IsOptimistic = false
+		api.log.WithError(simErr).Warn("block simulation failed in processOptimisticBlock, demoting builder")
+
+		// Demote the builder.
+		api.demoteBuilder(builderPubkey, &opts.req.BuilderSubmitBlockRequest, simErr)
+	}
+}
+
 func (api *RelayAPI) processPayloadAttributes(payloadAttributes beaconclient.PayloadAttributesEvent) {
 	apiHeadSlot := api.headSlot.Load()
 	payloadAttrSlot := payloadAttributes.Data.ProposalSlot
@@ -571,6 +686,9 @@ func (api *RelayAPI) processNewSlot(headSlot uint64) {
 	if api.opts.BlockBuilderAPI || api.opts.ProposerAPI {
 		// update proposer duties in the background
 		go api.updateProposerDuties(headSlot)
+
+		// update the optimistic slot
+		go api.prepareBuildersForSlot(headSlot)
 	}
 
 	// log
@@ -635,6 +753,39 @@ func (api *RelayAPI) updateProposerDuties(headSlot uint64) {
 	api.log.Infof("proposer duties updated: %s", strings.Join(_duties, ", "))
 }
 
+func (api *RelayAPI) prepareBuildersForSlot(headSlot uint64) {
+	// Wait until there are no optimistic blocks being processed. Then we can
+	// safely update the slot.
+	api.optimisticBlocksWG.Wait()
+	api.optimisticSlot.Store(headSlot + 1)
+
+	builders, err := api.db.GetBlockBuilders()
+	if err != nil {
+		api.log.WithError(err).Error("unable to read block builders from db, not updating builder cache")
+		return
+	}
+	newCache := make(map[string]*blockBuilderCacheEntry)
+	for _, v := range builders {
+		entry := &blockBuilderCacheEntry{ //nolint:exhaustruct
+			status: common.BuilderStatus{
+				IsHighPrio:    v.IsHighPrio,
+				IsBlacklisted: v.IsBlacklisted,
+				IsOptimistic:  v.IsOptimistic,
+			},
+		}
+		// Try to parse builder collateral string to big int.
+		builderCollateral, ok := big.NewInt(0).SetString(v.Collateral, 10)
+		if !ok {
+			api.log.WithError(err).Errorf("could not parse builder collateral string %s", v.Collateral)
+			entry.collateral = big.NewInt(0)
+		} else {
+			entry.collateral = builderCollateral
+		}
+		newCache[v.BuilderPubkey] = entry
+	}
+	api.blockBuildersCache = newCache
+}
+
 func (api *RelayAPI) startKnownValidatorUpdates() {
 	for {
 		// Refresh known validators
@@ -651,20 +802,18 @@ func (api *RelayAPI) startKnownValidatorUpdates() {
 }
 
 func (api *RelayAPI) RespondError(w http.ResponseWriter, code int, message string) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(code)
-	resp := HTTPErrorResp{code, message}
-	if err := json.NewEncoder(w).Encode(resp); err != nil {
-		api.log.WithField("response", resp).WithError(err).Error("Couldn't write error response")
-		http.Error(w, "", http.StatusInternalServerError)
-	}
+	api.Respond(w, code, HTTPErrorResp{code, message})
 }
 
 func (api *RelayAPI) RespondOK(w http.ResponseWriter, response any) {
+	api.Respond(w, http.StatusOK, response)
+}
+
+func (api *RelayAPI) Respond(w http.ResponseWriter, code int, response any) {
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
+	w.WriteHeader(code)
 	if err := json.NewEncoder(w).Encode(response); err != nil {
-		api.log.WithField("response", response).WithError(err).Error("Couldn't write OK response")
+		api.log.WithField("response", response).WithError(err).Error("Couldn't write response")
 		http.Error(w, "", http.StatusInternalServerError)
 	}
 }
@@ -947,11 +1096,6 @@ func (api *RelayAPI) handleGetHeader(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	if slot > headSlot+1 {
-		api.RespondError(w, http.StatusBadRequest, "slot is too far into the future")
-		return
-	}
-
 	log.Debug("getHeader request received")
 
 	if slices.Contains(apiNoHeaderUserAgents, ua) {
@@ -1161,21 +1305,25 @@ func (api *RelayAPI) handleGetPayload(w http.ResponseWriter, req *http.Request) 
 	log = log.WithField("timestampAfterLoadResponse", time.Now().UTC().UnixMilli())
 
 	// Check whether getPayload has already been called -- TODO: do we need to allow multiple submissions of one blinded block?
-	err = api.redis.CheckAndSetLastSlotDelivered(payload.Slot())
+	err = api.redis.CheckAndSetLastSlotAndHashDelivered(payload.Slot(), payload.BlockHash())
 	log = log.WithField("timestampAfterAlreadyDeliveredCheck", time.Now().UTC().UnixMilli())
 	if err != nil {
-		if errors.Is(err, datastore.ErrSlotAlreadyDelivered) {
-			// BAD VALIDATOR, 2x GETPAYLOAD
-			log.Warn("validator called getPayload twice")
-			api.RespondError(w, http.StatusBadRequest, "payload for this slot was already delivered")
+		if errors.Is(err, datastore.ErrAnotherPayloadAlreadyDeliveredForSlot) {
+			// BAD VALIDATOR, 2x GETPAYLOAD FOR DIFFERENT PAYLOADS
+			log.Warn("validator called getPayload twice for different payload hashes")
+			api.RespondError(w, http.StatusBadRequest, "another payload for this slot was already delivered")
 			return
+		} else if errors.Is(err, datastore.ErrPastSlotAlreadyDelivered) {
+			// BAD VALIDATOR, 2x GETPAYLOAD FOR PAST SLOT
+			log.Warn("validator called getPayload for past slot")
+			api.RespondError(w, http.StatusBadRequest, "payload for this slot was already delivered")
 		} else if errors.Is(err, redis.TxFailedErr) {
 			// BAD VALIDATOR, 2x GETPAYLOAD + RACE
 			log.Warn("validator called getPayload twice (race)")
 			api.RespondError(w, http.StatusBadRequest, "payload for this slot was already delivered (race)")
 			return
 		}
-		log.WithError(err).Error("redis.CheckAndSetLastSlotDelivered failed")
+		log.WithError(err).Error("redis.CheckAndSetLastSlotAndHashDelivered failed")
 	}
 
 	// Handle early/late requests
@@ -1256,6 +1404,59 @@ func (api *RelayAPI) handleGetPayload(w http.ResponseWriter, req *http.Request) 
 		if err != nil {
 			log.WithError(err).Error("failed to increment builder-stats after getPayload")
 		}
+
+		// Wait until optimistic blocks are complete.
+		api.optimisticBlocksWG.Wait()
+
+		// Check if there is a demotion for the winning block.
+		_, err = api.db.GetBuilderDemotion(bidTrace)
+		// If demotion not found, we are done!
+		if errors.Is(err, sql.ErrNoRows) {
+			log.Info("no demotion in getPayload, successful block proposal")
+			return
+		}
+		if err != nil {
+			log.WithError(err).Error("failed to read demotion table in getPayload")
+			return
+		}
+		// Demotion found, update the demotion table with refund data.
+		builderPubkey := bidTrace.BuilderPubkey.String()
+		log = log.WithFields(logrus.Fields{
+			"builderPubkey": builderPubkey,
+			"slot":          bidTrace.Slot,
+			"blockHash":     bidTrace.BlockHash,
+		})
+		log.Warn("demotion found in getPayload, inserting refund justification")
+
+		// Prepare refund data.
+		signedBeaconBlock := common.SignedBlindedBeaconBlockToBeaconBlock(payload, getPayloadResp)
+
+		// Get registration entry from the DB.
+		registrationEntry, err := api.db.GetValidatorRegistration(proposerPubkey.String())
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				log.WithError(err).Error("no registration found for validator " + proposerPubkey.String())
+			} else {
+				log.WithError(err).Error("error reading validator registration")
+			}
+		}
+		var signedRegistration *boostTypes.SignedValidatorRegistration
+		if registrationEntry != nil {
+			signedRegistration, err = registrationEntry.ToSignedValidatorRegistration()
+			if err != nil {
+				log.WithError(err).Error("error converting registration to signed registration")
+			}
+		}
+
+		err = api.db.UpdateBuilderDemotion(bidTrace, signedBeaconBlock, signedRegistration)
+		if err != nil {
+			log.WithFields(logrus.Fields{
+				"errorWritingRefundToDB": true,
+				"bidTrace":               bidTrace,
+				"signedBeaconBlock":      signedBeaconBlock,
+				"signedRegistration":     signedRegistration,
+			}).WithError(err).Error("unable to update builder demotion with refund justification")
+		}
 	}()
 }
 
@@ -1274,9 +1475,14 @@ func (api *RelayAPI) handleBuilderGetValidators(w http.ResponseWriter, req *http
 	}
 }
 
-func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Request) {
-	receivedAt := time.Now().UTC()
+func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Request) { //nolint:gocognit,maintidx
+	var pf common.Profile
+	var prevTime, nextTime time.Time
+
 	headSlot := api.headSlot.Load()
+	receivedAt := time.Now().UTC()
+	prevTime = receivedAt
+
 	args := req.URL.Query()
 	isCancellationEnabled := args.Get("cancellations") == "1"
 
@@ -1306,22 +1512,57 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 
 	var err error
 	var r io.Reader = req.Body
-	if req.Header.Get("Content-Encoding") == "gzip" {
+	isGzip := req.Header.Get("Content-Encoding") == "gzip"
+	log = log.WithField("reqIsGzip", isGzip)
+	if isGzip {
 		r, err = gzip.NewReader(req.Body)
 		if err != nil {
 			log.WithError(err).Warn("could not create gzip reader")
 			api.RespondError(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		log = log.WithField("gzip-req", true)
 	}
 
-	payload := new(common.BuilderSubmitBlockRequest)
-	if err := json.NewDecoder(r).Decode(payload); err != nil {
-		log.WithError(err).Warn("could not decode payload")
+	limitReader := io.LimitReader(r, 10*1024*1024) // 10 MB
+	requestPayloadBytes, err := io.ReadAll(limitReader)
+	if err != nil {
+		log.WithError(err).Warn("could not read payload")
 		api.RespondError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+
+	payload := new(common.BuilderSubmitBlockRequest)
+
+	// Check for SSZ encoding
+	contentType := req.Header.Get("Content-Type")
+	if contentType == "application/octet-stream" {
+		log = log.WithField("reqContentType", "ssz")
+		payload.Capella = new(builderCapella.SubmitBlockRequest)
+		if err = payload.Capella.UnmarshalSSZ(requestPayloadBytes); err != nil {
+			log.WithError(err).Warn("could not decode payload - SSZ")
+
+			// SSZ decoding failed. try JSON as fallback (some builders used octet-stream for json before)
+			if err2 := json.Unmarshal(requestPayloadBytes, payload); err2 != nil {
+				log.WithError(err).Warn("could not decode payload - SSZ or JSON")
+				api.RespondError(w, http.StatusBadRequest, err.Error())
+				return
+			}
+			log = log.WithField("reqContentType", "json")
+		} else {
+			log.Debug("received ssz-encoded payload")
+		}
+	} else {
+		log = log.WithField("reqContentType", "json")
+		if err := json.Unmarshal(requestPayloadBytes, payload); err != nil {
+			log.WithError(err).Warn("could not decode payload - JSON")
+			api.RespondError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+	}
+
+	nextTime = time.Now().UTC()
+	pf.Decode = uint64(nextTime.Sub(prevTime).Microseconds())
+	prevTime = nextTime
 
 	log = log.WithFields(logrus.Fields{
 		"timestampAfterDecoding": time.Now().UTC().UnixMilli(),
@@ -1350,16 +1591,27 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 	}
 
 	if payload.Slot() <= headSlot {
-		api.log.Info("submitNewBlock failed: submission for past slot")
+		log.Info("submitNewBlock failed: submission for past slot")
 		api.RespondError(w, http.StatusBadRequest, "submission for past slot")
 		return
 	}
 
-	if payload.Slot() > headSlot+1 {
-		api.log.Info("submitNewBlock failed: submission for future slot")
-		api.RespondError(w, http.StatusBadRequest, "submission for future slot")
-		return
+	builderPubkey := payload.BuilderPubkey()
+	builderEntry, ok := api.blockBuildersCache[builderPubkey.String()]
+	if !ok {
+		log.Warnf("unable to read builder: %s from the builder cache, using low-prio and no collateral", builderPubkey.String())
+		builderEntry = &blockBuilderCacheEntry{
+			status: common.BuilderStatus{
+				IsHighPrio:    false,
+				IsOptimistic:  false,
+				IsBlacklisted: false,
+			},
+			collateral: big.NewInt(0),
+		}
 	}
+	log = log.WithFields(logrus.Fields{
+		"builderEntry": builderEntry,
+	})
 
 	// Timestamp check
 	expectedTimestamp := api.genesisInfo.Data.GenesisTime + (payload.Slot() * common.SecondsPerSlot)
@@ -1369,21 +1621,15 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 		return
 	}
 
-	// TODO: have the builder status in-memory, rather than going through redis every time
-	builderIsHighPrio, builderIsBlacklisted, err := api.redis.GetBlockBuilderStatus(payload.BuilderPubkey().String())
-	log = log.WithFields(logrus.Fields{
-		"builderIsHighPrio":    builderIsHighPrio,
-		"builderIsBlacklisted": builderIsBlacklisted,
-	})
-	if err != nil {
-		log.WithError(err).Error("could not get block builder status")
-	} else if builderIsBlacklisted {
+	if builderEntry.status.IsBlacklisted {
 		log.Info("builder is blacklisted")
 		time.Sleep(200 * time.Millisecond)
 		w.WriteHeader(http.StatusOK)
 		return
-	} else if api.ffDisableLowPrioBuilders && !builderIsHighPrio {
-		// In case only high-prio requests are accepted, fail others
+	}
+
+	// In case only high-prio requests are accepted, fail others
+	if api.ffDisableLowPrioBuilders && !builderEntry.status.IsHighPrio {
 		log.Info("rejecting low-prio builder (ff-disable-low-prio-builders)")
 		time.Sleep(200 * time.Millisecond)
 		w.WriteHeader(http.StatusOK)
@@ -1400,7 +1646,7 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 		log.Warn("could not find slot duty")
 		api.RespondError(w, http.StatusBadRequest, "could not find slot duty")
 		return
-	} else if slotDuty.Entry.Message.FeeRecipient.String() != payload.ProposerFeeRecipient() {
+	} else if !strings.EqualFold(slotDuty.Entry.Message.FeeRecipient.String(), payload.ProposerFeeRecipient()) {
 		log.WithFields(logrus.Fields{
 			"expectedFeeRecipient": slotDuty.Entry.Message.FeeRecipient.String(),
 			"actualFeeRecipient":   payload.ProposerFeeRecipient(),
@@ -1411,7 +1657,7 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 
 	// Don't accept blocks with 0 value
 	if payload.Value().Cmp(ZeroU256.BigInt()) == 0 || payload.NumTx() == 0 {
-		api.log.Info("submitNewBlock failed: block with 0 value or no txs")
+		log.Info("submitNewBlock failed: block with 0 value or no txs")
 		w.WriteHeader(http.StatusOK)
 		return
 	}
@@ -1460,7 +1706,6 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 
 	// Verify the signature
 	log = log.WithField("timestampBeforeSignatureCheck", time.Now().UTC().UnixMilli())
-	builderPubkey := payload.BuilderPubkey()
 	signature := payload.Signature()
 	ok, err = boostTypes.VerifySignature(payload.Message(), api.opts.EthNetDetails.DomainBuilder, builderPubkey[:], signature[:])
 	log = log.WithField("timestampAfterSignatureCheck", time.Now().UTC().UnixMilli())
@@ -1480,14 +1725,14 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 		return
 	}
 
-	var wasSimulated bool
+	var wasSimulated, optimisticSubmission bool
 	var requestErr, validationErr error
 	var eligibleAt time.Time
 
 	// Save the builder submission to the database whenever this function ends
 	defer func() {
 		savePayloadToDatabase := !api.ffDisablePayloadDBStorage
-		submissionEntry, err := api.db.SaveBuilderBlockSubmission(payload, requestErr, validationErr, receivedAt, eligibleAt, wasSimulated, savePayloadToDatabase)
+		submissionEntry, err := api.db.SaveBuilderBlockSubmission(payload, requestErr, validationErr, receivedAt, eligibleAt, wasSimulated, savePayloadToDatabase, pf, optimisticSubmission)
 		if err != nil {
 			log.WithError(err).WithField("payload", payload).Error("saving builder block submission to database failed")
 			return
@@ -1499,64 +1744,109 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 		}
 	}()
 
+	// Get the latest builder bid value from Redis.
+	latestBuilderValue, err := api.redis.GetBuilderLatestValue(payload.Slot(), payload.ParentHash(), payload.ProposerPubkey(), payload.BuilderPubkey().String())
+	if err != nil {
+		log.WithError(err).Error("failed to get latest builder bid value from redis")
+	} else {
+		bidHasHigherValue := payload.Value().Cmp(latestBuilderValue) == 1
+		log = log.WithFields(logrus.Fields{
+			"latestValue":          latestBuilderValue.String(),
+			"newBidHasHigherValue": bidHasHigherValue,
+		})
+
+		// Without cancellations, discard lower or similar value submissions.
+		if !isCancellationEnabled && !bidHasHigherValue {
+			log.Info("rejecting submission because without cancellation and not higher value than previous bid by this builder")
+			api.Respond(w, http.StatusAccepted, struct{ message string }{message: "ignoring submission because lower or equal value than previous bid"})
+			return
+		}
+	}
+
 	// Get the latest top bid value from Redis
+	bidIsTopBid := false
 	topBidValue, err := api.redis.GetTopBidValue(payload.Slot(), payload.ParentHash(), payload.ProposerPubkey())
 	if err != nil {
 		log.WithError(err).Error("failed to get top bid value from redis")
 	} else {
+		bidIsTopBid = payload.Value().Cmp(topBidValue) == 1
 		log = log.WithFields(logrus.Fields{
-			"preTopBidValue":       topBidValue.String(),
-			"newBidHasHigherValue": payload.Value().Cmp(topBidValue) == 1,
+			"topBidValue":    topBidValue.String(),
+			"newBidIsTopBid": bidIsTopBid,
 		})
-
-		// Without cancellations, discard lower or similar value submissions to previous top bid
-		if !isCancellationEnabled && payload.Value().Cmp(topBidValue) < 1 {
-			log.Info("rejecting submission because it is lower or equal to the top bid (redis)")
-			w.WriteHeader(http.StatusOK)
-			return
-		}
 	}
 
 	// Simulate the block submission and save to db
+	fastTrackValidation := builderEntry.status.IsHighPrio && bidIsTopBid
 	timeBeforeValidation := time.Now().UTC()
-	log = log.WithField("timestampBeforeValidation", timeBeforeValidation.UTC().UnixMilli())
-	validationRequestPayload := &common.BuilderBlockValidationRequest{
-		BuilderSubmitBlockRequest: *payload,
-		RegisteredGasLimit:        slotDuty.Entry.Message.GasLimit,
-	}
-	requestErr, validationErr = api.blockSimRateLimiter.Send(req.Context(), validationRequestPayload, builderIsHighPrio)
-	validationDurationMs := time.Since(timeBeforeValidation).Milliseconds()
+
 	log = log.WithFields(logrus.Fields{
-		"timestampAfterValidation": time.Now().UTC().UnixMilli(),
-		"validationDurationMs":     validationDurationMs,
+		"timestampBeforeValidation": timeBeforeValidation.UTC().UnixMilli(),
+		"fastTrackValidation":       fastTrackValidation,
 	})
 
-	if requestErr != nil {
-		// Request error -- log and return error
-		log.WithFields(logrus.Fields{
-			"requestErr": requestErr.Error(),
-			"durationMs": validationDurationMs,
-		}).Info("block validation failed - request error")
-		if os.IsTimeout(requestErr) {
-			api.RespondError(w, http.StatusGatewayTimeout, "validation request timeout")
-		} else {
-			api.RespondError(w, http.StatusBadRequest, requestErr.Error())
-		}
-		return
+	nextTime = time.Now().UTC()
+	pf.Prechecks = uint64(nextTime.Sub(prevTime).Microseconds())
+	prevTime = nextTime
+
+	// Construct simulation request.
+	opts := blockSimOptions{
+		isHighPrio: builderEntry.status.IsHighPrio,
+		fastTrack:  fastTrackValidation,
+		log:        log,
+		builder:    builderEntry,
+		req: &common.BuilderBlockValidationRequest{
+			BuilderSubmitBlockRequest: *payload,
+			RegisteredGasLimit:        slotDuty.Entry.Message.GasLimit,
+		},
+	}
+	// With sufficient collateral, process the block optimistically.
+	if builderEntry.status.IsOptimistic &&
+		builderEntry.collateral.Cmp(payload.Value()) >= 0 &&
+		payload.Slot() == api.optimisticSlot.Load() {
+		optimisticSubmission = true
+		go api.processOptimisticBlock(opts)
 	} else {
-		wasSimulated = true
-		if validationErr != nil {
+		// Simulate block (synchronously).
+		reqErr, simErr := api.simulateBlock(req.Context(), opts)
+		validationDurationMs := time.Since(timeBeforeValidation).Milliseconds()
+		log = log.WithFields(logrus.Fields{
+			"timestampAfterValidation": time.Now().UTC().UnixMilli(),
+			"validationDurationMs":     validationDurationMs,
+		})
+		if reqErr != nil {
+			// Request error -- log and return error
 			log.WithFields(logrus.Fields{
-				"validationErr": validationErr.Error(),
-				"durationMs":    validationDurationMs,
-			}).Info("block validation failed - validation error")
-			api.RespondError(w, http.StatusBadRequest, validationErr.Error())
+				"requestErr": reqErr.Error(),
+				"durationMs": validationDurationMs,
+			}).Info("block validation failed - request error")
+			if os.IsTimeout(reqErr) {
+				api.RespondError(w, http.StatusGatewayTimeout, "validation request timeout")
+			} else {
+				api.RespondError(w, http.StatusBadRequest, reqErr.Error())
+			}
 			return
+		} else {
+			wasSimulated = true
+			if simErr != nil {
+				log.WithFields(logrus.Fields{
+					"validationErr": simErr.Error(),
+					"durationMs":    validationDurationMs,
+				}).Info("block validation failed - validation error")
+				api.RespondError(w, http.StatusBadRequest, simErr.Error())
+				return
+			}
 		}
 	}
 
-	// Log successful validation
-	log.WithField("durationMs", validationDurationMs).Info("block validation successful")
+	nextTime = time.Now().UTC()
+	pf.Simulation = uint64(nextTime.Sub(prevTime).Microseconds())
+	prevTime = nextTime
+
+	log = log.WithField("timestampAfterValidation", time.Now().UTC().UnixMilli())
+	log.WithFields(logrus.Fields{
+		"numWaiting": api.blockSimRateLimiter.CurrentCounter(),
+	}).Info("block validation successful")
 
 	// If cancellations are enabled, then abort now if this submission is not the latest one
 	if isCancellationEnabled {
@@ -1647,56 +1937,92 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 		}
 	}
 
+	nextTime = time.Now().UTC()
+	pf.RedisUpdate = uint64(nextTime.Sub(prevTime).Microseconds())
+	pf.Total = uint64(nextTime.Sub(receivedAt).Microseconds())
+
+	// Respond with OK (TODO: proper response data type https://flashbots.notion.site/Relay-API-Spec-5fb0819366954962bc02e81cb33840f5#fa719683d4ae4a57bc3bf60e138b0dc6)
 	// All done
 	log.Info("received block from builder")
 	w.WriteHeader(http.StatusOK)
 }
 
 // ---------------
-//  INTERNAL APIS
+//
+//	INTERNAL APIS
+//
 // ---------------
-
 func (api *RelayAPI) handleInternalBuilderStatus(w http.ResponseWriter, req *http.Request) {
 	vars := mux.Vars(req)
 	builderPubkey := vars["pubkey"]
-
-	if req.Method == http.MethodGet {
-		builderEntry, err := api.db.GetBlockBuilderByPubkey(builderPubkey)
-		if err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
-				api.RespondError(w, http.StatusBadRequest, "builder not found")
-				return
-			}
-
-			api.log.WithError(err).Error("could not get block builder")
-			api.RespondError(w, http.StatusInternalServerError, err.Error())
+	builderEntry, err := api.db.GetBlockBuilderByPubkey(builderPubkey)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			api.RespondError(w, http.StatusBadRequest, "builder not found")
 			return
 		}
 
+		api.log.WithError(err).Error("could not get block builder")
+		api.RespondError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if req.Method == http.MethodGet {
 		api.RespondOK(w, builderEntry)
 		return
 	} else if req.Method == http.MethodPost || req.Method == http.MethodPut || req.Method == http.MethodPatch {
+		st := common.BuilderStatus{
+			IsHighPrio:    builderEntry.IsHighPrio,
+			IsBlacklisted: builderEntry.IsBlacklisted,
+			IsOptimistic:  builderEntry.IsOptimistic,
+		}
+		trueStr := "true"
 		args := req.URL.Query()
-		isHighPrio := args.Get("high_prio") == "true"
-		isBlacklisted := args.Get("blacklisted") == "true"
+		if args.Get("high_prio") != "" {
+			st.IsHighPrio = args.Get("high_prio") == trueStr
+		}
+		if args.Get("blacklisted") != "" {
+			st.IsBlacklisted = args.Get("blacklisted") == trueStr
+		}
+		if args.Get("optimistic") != "" {
+			st.IsOptimistic = args.Get("optimistic") == trueStr
+		}
 		api.log.WithFields(logrus.Fields{
 			"builderPubkey": builderPubkey,
-			"isHighPrio":    isHighPrio,
-			"isBlacklisted": isBlacklisted,
+			"isHighPrio":    st.IsHighPrio,
+			"isBlacklisted": st.IsBlacklisted,
+			"isOptimistic":  st.IsOptimistic,
 		}).Info("updating builder status")
-
-		newStatus := datastore.MakeBlockBuilderStatus(isHighPrio, isBlacklisted)
-		err := api.redis.SetBlockBuilderStatus(builderPubkey, newStatus)
+		err := api.db.SetBlockBuilderStatus(builderPubkey, st)
 		if err != nil {
-			api.log.WithError(err).Error("could not set block builder status in redis")
+			err := fmt.Errorf("error setting builder: %v status: %w", builderPubkey, err)
+			api.log.Error(err)
+			api.RespondError(w, http.StatusInternalServerError, err.Error())
+			return
 		}
+		api.RespondOK(w, st)
+	}
+}
 
-		err = api.db.SetBlockBuilderStatus(builderPubkey, isHighPrio, isBlacklisted)
-		if err != nil {
-			api.log.WithError(err).Error("could not set block builder status in database")
+func (api *RelayAPI) handleInternalBuilderCollateral(w http.ResponseWriter, req *http.Request) {
+	vars := mux.Vars(req)
+	builderPubkey := vars["pubkey"]
+	if req.Method == http.MethodPost || req.Method == http.MethodPut {
+		args := req.URL.Query()
+		collateral := args.Get("collateral")
+		value := args.Get("value")
+		log := api.log.WithFields(logrus.Fields{
+			"pubkey":     builderPubkey,
+			"collateral": collateral,
+			"value":      value,
+		})
+		log.Infof("updating builder collateral")
+		if err := api.db.SetBlockBuilderCollateral(builderPubkey, collateral, value); err != nil {
+			fullErr := fmt.Errorf("unable to set collateral in db for pubkey: %v: %w", builderPubkey, err)
+			log.Error(fullErr.Error())
+			api.RespondError(w, http.StatusInternalServerError, fullErr.Error())
+			return
 		}
-
-		api.RespondOK(w, struct{ newStatus string }{newStatus: string(newStatus)})
+		api.RespondOK(w, NilResponse)
 	}
 }
 
