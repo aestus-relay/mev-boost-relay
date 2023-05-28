@@ -23,6 +23,7 @@ import (
 var (
 	redisScheme = "redis://"
 	redisPrefix = "boost-relay"
+	redisBidHash = "bid-stats"
 
 	expiryBidCache = 45 * time.Second
 
@@ -129,8 +130,8 @@ func NewRedisCache(prefix string, redisURIs []string, redisPassword string) (*Re
 		keyStats:              fmt.Sprintf("%s/%s:stats", redisPrefix, prefix),
 		keyProposerDuties:     fmt.Sprintf("%s/%s:proposer-duties", redisPrefix, prefix),
 		keyBlockBuilderStatus: fmt.Sprintf("%s/%s:block-builder-status", redisPrefix, prefix),
-		keyLastSlotDelivered:  fmt.Sprintf("%s/%s:last-slot-delivered", redisPrefix, prefix),
-		keyLastHashDelivered:  fmt.Sprintf("%s/%s:last-hash-delivered", redisPrefix, prefix),
+		keyLastSlotDelivered:  fmt.Sprintf("%s/%s#{%s}:last-slot-delivered", redisPrefix, prefix, redisBidHash),
+		keyLastHashDelivered:  fmt.Sprintf("%s/%s#{%s}:last-hash-delivered", redisPrefix, prefix, redisBidHash),
 	}, nil
 }
 
