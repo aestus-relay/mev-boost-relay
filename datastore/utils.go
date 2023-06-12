@@ -2,7 +2,6 @@ package datastore
 
 import (
 	"context"
-	"errors"
 	"math/big"
 
 	"github.com/go-redis/redis/v9"
@@ -15,13 +14,7 @@ type BuilderBids struct {
 
 func NewBuilderBidsFromRedis(ctx context.Context, r *RedisCache, pipeliner redis.Pipeliner, slot uint64, parentHash, proposerPubkey string) (*BuilderBids, error) {
 	keyBidValues := r.keyBlockBuilderLatestBidsValue(slot, parentHash, proposerPubkey)
-	c := pipeliner.HGetAll(ctx, keyBidValues)
-	_, err := pipeliner.Exec(ctx)
-	if err != nil && !errors.Is(err, redis.Nil) {
-		return nil, err
-	}
-
-	bidValueMap, err := c.Result()
+	bidValueMap, err := r.HGetAllPL(ctx, pipeliner, keyBidValues)
 	if err != nil {
 		return nil, err
 	}
