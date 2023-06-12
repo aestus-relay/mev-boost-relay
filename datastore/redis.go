@@ -205,7 +205,12 @@ func (r *RedisCache) SetObj(key string, value any, expiration time.Duration) (er
 }
 
 // SetObjPipelined saves an object in the given Redis key on a Redis pipeline (JSON encoded)
+
 func (r *RedisCache) SetObjPipelined(ctx context.Context, pipeliner redis.Pipeliner, key string, value any, expiration time.Duration) (err error) {
+	if pipeliner == nil {
+		return r.SetObj(key, value, expiration)
+	}
+
 	marshalledValue, err := json.Marshal(value)
 	if err != nil {
 		return err
@@ -291,8 +296,7 @@ func (r *RedisCache) CheckAndSetLastSlotAndHashDelivered(slot uint64, hash strin
 }
 
 func (r *RedisCache) GetLastSlotDelivered(ctx context.Context, pipeliner redis.Pipeliner) (slot uint64, err error) {
-	c := pipeliner.Get(ctx, r.keyLastSlotDelivered)
-	_, err = pipeliner.Exec(ctx)
+	c, err := r.GetPL(ctx, pipeliner, r.keyLastSlotDelivered)
 	if err != nil {
 		return 0, err
 	}
@@ -401,7 +405,7 @@ func (r *RedisCache) SaveExecutionPayloadCapella(ctx context.Context, pipeliner 
 	if err != nil {
 		return err
 	}
-	return pipeliner.Set(ctx, key, b, expiryBidCache).Err()
+	return r.SetPL(ctx, pipeliner, key, b, expiryBidCache)
 }
 
 func (r *RedisCache) GetExecutionPayloadCapella(slot uint64, proposerPubkey, blockHash string) (*builderApi.VersionedSubmitBlindedBlockResponse, error) {
@@ -439,8 +443,7 @@ func (r *RedisCache) GetBidTrace(slot uint64, proposerPubkey, blockHash string) 
 
 func (r *RedisCache) GetBuilderLatestPayloadReceivedAt(ctx context.Context, pipeliner redis.Pipeliner, slot uint64, builderPubkey, parentHash, proposerPubkey string) (int64, error) {
 	keyLatestBidsTime := r.keyBlockBuilderLatestBidsTime(slot, parentHash, proposerPubkey)
-	c := pipeliner.HGet(context.Background(), keyLatestBidsTime, builderPubkey)
-	_, err := pipeliner.Exec(ctx)
+	c, err := r.HGetPL(context.Background(), pipeliner, keyLatestBidsTime, builderPubkey)
 	if errors.Is(err, redis.Nil) {
 		return 0, nil
 	} else if err != nil {
@@ -460,11 +463,11 @@ func (r *RedisCache) SaveBuilderBid(ctx context.Context, pipeliner redis.Pipelin
 
 	// set the time of the request
 	keyLatestBidsTime := r.keyBlockBuilderLatestBidsTime(slot, parentHash, proposerPubkey)
-	err = pipeliner.HSet(ctx, keyLatestBidsTime, builderPubkey, receivedAt.UnixMilli()).Err()
+	err = r.HSetPL(ctx, pipeliner, keyLatestBidsTime, builderPubkey, receivedAt.UnixMilli())
 	if err != nil {
 		return err
 	}
-	err = pipeliner.Expire(ctx, keyLatestBidsTime, expiryBidCache).Err()
+	err = r.ExpirePL(ctx, pipeliner, keyLatestBidsTime, expiryBidCache)
 	if err != nil {
 		return err
 	}
@@ -475,11 +478,11 @@ func (r *RedisCache) SaveBuilderBid(ctx context.Context, pipeliner redis.Pipelin
 	if err != nil {
 		return err
 	}
-	err = pipeliner.HSet(ctx, keyLatestBidsValue, builderPubkey, value.ToBig().String()).Err()
+	err = r.HSetPL(ctx, pipeliner, keyLatestBidsValue, builderPubkey, value.ToBig().String())
 	if err != nil {
 		return err
 	}
-	return pipeliner.Expire(ctx, keyLatestBidsValue, expiryBidCache).Err()
+	return r.ExpirePL(ctx, pipeliner, keyLatestBidsValue, expiryBidCache)
 }
 
 type SaveBidAndUpdateTopBidResponse struct {
@@ -612,31 +615,24 @@ func (r *RedisCache) SaveBidAndUpdateTopBid(ctx context.Context, pipeliner redis
 	// Non-cancellable bid above floor should set new floor
 	keyBidSource := r.keyLatestBidByBuilder(submission.BidTrace.Slot, submission.BidTrace.ParentHash.String(), submission.BidTrace.ProposerPubkey.String(), submission.BidTrace.BuilderPubkey.String())
 	keyFloorBid := r.keyFloorBid(submission.BidTrace.Slot, submission.BidTrace.ParentHash.String(), submission.BidTrace.ProposerPubkey.String())
-	c := pipeliner.Copy(ctx, keyBidSource, keyFloorBid, 0, true)
-	_, err = pipeliner.Exec(ctx)
+	resp := new(builderSpec.VersionedSignedBuilderBid)
+	err = r.CopyPL(ctx, pipeliner, keyBidSource, keyFloorBid, 0, true, resp)
 	if err != nil {
 		return state, err
 	}
-
-	wasCopied, copyErr := c.Result()
-	if copyErr != nil {
-		return state, copyErr
-	} else if wasCopied == 0 {
-		return state, fmt.Errorf("could not copy floor bid from %s to %s", keyBidSource, keyFloorBid) //nolint:goerr113
-	}
-	err = pipeliner.Expire(ctx, keyFloorBid, expiryBidCache).Err()
+	err = r.ExpirePL(ctx, pipeliner, keyFloorBid, expiryBidCache)
 	if err != nil {
 		return state, err
 	}
 
 	keyFloorBidValue := r.keyFloorBidValue(submission.BidTrace.Slot, submission.BidTrace.ParentHash.String(), submission.BidTrace.ProposerPubkey.String())
-	err = pipeliner.Set(ctx, keyFloorBidValue, submission.BidTrace.Value.Dec(), expiryBidCache).Err()
+	err = r.SetPL(ctx, pipeliner, keyFloorBidValue, submission.BidTrace.Value.Dec(), expiryBidCache)
 	if err != nil {
 		return state, err
 	}
 
 	// Execute setting the floor bid
-	_, err = pipeliner.Exec(ctx)
+	err = r.ExecPL(ctx, pipeliner)
 
 	// Record time needed to update floor
 	nextTime = time.Now().UTC()
@@ -677,18 +673,12 @@ func (r *RedisCache) _updateTopBid(ctx context.Context, pipeliner redis.Pipeline
 
 	// Copy winning bid to top bid cache
 	keyTopBid := r.keyCacheGetHeaderResponse(slot, parentHash, proposerPubkey)
-	c := pipeliner.Copy(context.Background(), keyBidSource, keyTopBid, 0, true)
-	_, err = pipeliner.Exec(ctx)
+	intermediate := new(builderSpec.VersionedSignedBuilderBid)
+	err = r.CopyPL(context.Background(), pipeliner, keyBidSource, keyTopBid, 0, true, intermediate)
 	if err != nil {
 		return state, err
 	}
-	wasCopied, err := c.Result()
-	if err != nil {
-		return state, err
-	} else if wasCopied == 0 {
-		return state, fmt.Errorf("could not copy top bid from %s to %s", keyBidSource, keyTopBid) //nolint:goerr113
-	}
-	err = pipeliner.Expire(context.Background(), keyTopBid, expiryBidCache).Err()
+	err = r.ExpirePL(context.Background(), pipeliner, keyTopBid, expiryBidCache)
 	if err != nil {
 		return state, err
 	}
@@ -697,20 +687,19 @@ func (r *RedisCache) _updateTopBid(ctx context.Context, pipeliner redis.Pipeline
 
 	// 6. Finally, update the global top bid value
 	keyTopBidValue := r.keyTopBidValue(slot, parentHash, proposerPubkey)
-	err = pipeliner.Set(context.Background(), keyTopBidValue, state.TopBidValue.String(), expiryBidCache).Err()
+	err = r.SetPL(context.Background(), pipeliner, keyTopBidValue, state.TopBidValue.String(), expiryBidCache)
 	if err != nil {
 		return state, err
 	}
 
-	_, err = pipeliner.Exec(ctx)
+	err = r.ExecPL(ctx, pipeliner)
 	return state, err
 }
 
 // GetTopBidValue gets the top bid value for a given slot+parent+proposer combination
 func (r *RedisCache) GetTopBidValue(ctx context.Context, pipeliner redis.Pipeliner, slot uint64, parentHash, proposerPubkey string) (topBidValue *big.Int, err error) {
 	keyTopBidValue := r.keyTopBidValue(slot, parentHash, proposerPubkey)
-	c := pipeliner.Get(ctx, keyTopBidValue)
-	_, err = pipeliner.Exec(ctx)
+	c, err := r.GetPL(ctx, pipeliner, keyTopBidValue)
 	if errors.Is(err, redis.Nil) {
 		return big.NewInt(0), nil
 	} else if err != nil {
@@ -771,9 +760,7 @@ func (r *RedisCache) DelBuilderBid(ctx context.Context, pipeliner redis.Pipeline
 // GetFloorBidValue returns the value of the highest non-cancellable bid
 func (r *RedisCache) GetFloorBidValue(ctx context.Context, pipeliner redis.Pipeliner, slot uint64, parentHash, proposerPubkey string) (floorValue *big.Int, err error) {
 	keyFloorBidValue := r.keyFloorBidValue(slot, parentHash, proposerPubkey)
-	c := pipeliner.Get(ctx, keyFloorBidValue)
-
-	_, err = pipeliner.Exec(ctx)
+	c, err := r.GetPL(ctx, pipeliner, keyFloorBidValue)
 	if errors.Is(err, redis.Nil) {
 		return big.NewInt(0), nil
 	} else if err != nil {
@@ -815,4 +802,102 @@ func (r *RedisCache) NewPipeline() redis.Pipeliner { //nolint:ireturn,nolintlint
 
 func (r *RedisCache) NewTxPipeline() redis.Pipeliner { //nolint:ireturn
 	return r.client.TxPipeline()
+}
+
+func (r *RedisCache) GetPL(ctx context.Context, pipeliner redis.Pipeliner, key string) (*redis.StringCmd, error) {
+	if pipeliner == nil {
+		c := r.client.Get(ctx, key)
+		return c, c.Err()
+	}
+	c := pipeliner.Get(ctx, key)
+	_, err := pipeliner.Exec(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return c, err
+}
+
+func (r *RedisCache) SetPL(ctx context.Context, pipeliner redis.Pipeliner, key string, value interface{}, expiration time.Duration) error {
+	if pipeliner == nil {
+		return r.client.Set(ctx, key, value, expiration).Err()
+	}
+	return pipeliner.Set(ctx, key, value, expiration).Err()
+}
+
+func (r *RedisCache) HGetPL(ctx context.Context, pipeliner redis.Pipeliner, key, field string) (*redis.StringCmd, error) {
+	if pipeliner == nil {
+		c := r.client.HGet(ctx, key, field)
+		return c, c.Err()
+	}
+
+	c := pipeliner.HGet(ctx, key, field)
+	_, err := pipeliner.Exec(ctx)
+	if err != nil {
+		return c, err
+	}
+	return c, err
+}
+
+func (r *RedisCache) HGetAllPL(ctx context.Context, pipeliner redis.Pipeliner, key string) (map[string]string, error) {
+	if pipeliner == nil {
+		return r.client.HGetAll(ctx, key).Result()
+	}
+
+	c := pipeliner.HGetAll(ctx, key)
+	_, err := pipeliner.Exec(ctx)
+	if err != nil && !errors.Is(err, redis.Nil) {
+		return nil, err
+	}
+	value, err := c.Result()
+	if err != nil {
+		return nil, err
+	}
+	return value, err
+}
+
+func (r *RedisCache) HSetPL(ctx context.Context, pipeliner redis.Pipeliner, key, field string, value interface{}) error {
+	if pipeliner == nil {
+		return r.client.HSet(ctx, key, field, value).Err()
+	}
+	return pipeliner.HSet(ctx, key, field, value).Err()
+}
+
+func (r *RedisCache) ExpirePL(ctx context.Context, pipeliner redis.Pipeliner, key string, expiration time.Duration) error {
+	if pipeliner == nil {
+		return r.client.Expire(ctx, key, expiration).Err()
+	}
+	return pipeliner.Expire(ctx, key, expiration).Err()
+}
+
+func (r *RedisCache) CopyPL(ctx context.Context, pipeliner redis.Pipeliner, src, dest string, db int, replace bool, obj any) error {
+	if pipeliner == nil {
+		// Have to break this up into a get and set to prevent crossslot errors
+		err := r.GetObj(src, obj)
+		if err != nil {
+			return err
+		}
+		return r.SetObj(dest, obj, expiryBidCache) // Not generalizable, but works
+	}
+
+	c := pipeliner.Copy(ctx, src, dest, db, replace)
+	_, err := pipeliner.Exec(ctx)
+	if err != nil {
+		return err
+	}
+
+	wasCopied, copyErr := c.Result()
+	if copyErr != nil {
+		return copyErr
+	} else if wasCopied == 0 {
+		return fmt.Errorf("could not copy from %s to %s", src, dest) //nolint:goerr113
+	}
+	return nil
+}
+
+func (r *RedisCache) ExecPL(ctx context.Context, pipeliner redis.Pipeliner) error {
+	if pipeliner == nil {
+		return nil
+	}
+	_, err := pipeliner.Exec(ctx)
+	return err
 }
