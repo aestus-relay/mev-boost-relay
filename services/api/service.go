@@ -1995,7 +1995,8 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 	}
 
 	// Create the redis pipeline tx
-	tx := api.redis.NewTxPipeline()
+	// Using nil instead to disable large-scale pipeline for cluster
+	tx := redis.Pipeliner(nil)
 
 	// channel to send simulation result to the deferred function
 	simResultC := make(chan *blockSimResult, 1)
