@@ -54,7 +54,7 @@ var (
 	ErrServerAlreadyStarted       = errors.New("server was already started")
 	ErrBuilderAPIWithoutSecretKey = errors.New("cannot start builder API without secret key")
 	ErrMismatchedForkVersions     = errors.New("can not find matching fork versions as retrieved from beacon node")
-	ErrMissingForkVersions        = errors.New("invalid bellatrix/capella fork version from beacon node")
+	ErrMissingForkVersions        = errors.New("invalid fork version from beacon node")
 )
 
 var (
@@ -78,11 +78,11 @@ var (
 	pathInternalBuilderCollateral = "/internal/v1/builder/collateral/{pubkey:0x[a-fA-F0-9]+}"
 
 	// number of goroutines to save active validator
-	numActiveValidatorProcessors = cli.GetEnvInt("NUM_ACTIVE_VALIDATOR_PROCESSORS", 10)
-	numValidatorRegProcessors    = cli.GetEnvInt("NUM_VALIDATOR_REG_PROCESSORS", 10)
+	numValidatorRegProcessors = cli.GetEnvInt("NUM_VALIDATOR_REG_PROCESSORS", 10)
 
 	// various timings
 	timeoutGetPayloadRetryMs  = cli.GetEnvInt("GETPAYLOAD_RETRY_TIMEOUT_MS", 100)
+	getHeaderRequestCutoffMs  = cli.GetEnvInt("GETHEADER_REQUEST_CUTOFF_MS", 3000)
 	getPayloadRequestCutoffMs = cli.GetEnvInt("GETPAYLOAD_REQUEST_CUTOFF_MS", 4000)
 	getPayloadResponseDelayMs = cli.GetEnvInt("GETPAYLOAD_RESPONSE_DELAY_MS", 1000)
 
@@ -92,6 +92,9 @@ var (
 	apiWriteTimeoutMs      = cli.GetEnvInt("API_TIMEOUT_WRITE_MS", 10000)
 	apiIdleTimeoutMs       = cli.GetEnvInt("API_TIMEOUT_IDLE_MS", 3000)
 	apiMaxHeaderBytes      = cli.GetEnvInt("API_MAX_HEADER_BYTES", 60000)
+
+	// maximum payload bytes for a block submission to be fast-tracked (large payloads slow down other fast-tracked requests!)
+	fastTrackPayloadSizeLimit = cli.GetEnvInt("FAST_TRACK_PAYLOAD_SIZE_LIMIT", 230_000)
 
 	// user-agents which shouldn't receive bids
 	apiNoHeaderUserAgents = common.GetEnvStrSlice("NO_HEADER_USERAGENTS", []string{
@@ -146,6 +149,13 @@ type blockBuilderCacheEntry struct {
 	collateral *big.Int
 }
 
+type blockSimResult struct {
+	wasSimulated         bool
+	optimisticSubmission bool
+	requestErr           error
+	validationErr        error
+}
+
 // RelayAPI represents a single Relay instance
 type RelayAPI struct {
 	opts RelayAPIOpts
@@ -163,10 +173,9 @@ type RelayAPI struct {
 	memcached    *datastore.Memcached
 	db           database.IDatabaseService
 
-	headSlot       uberatomic.Uint64
-	genesisInfo    *beaconclient.GetGenesisResponse
-	bellatrixEpoch uint64
-	capellaEpoch   uint64
+	headSlot     uberatomic.Uint64
+	genesisInfo  *beaconclient.GetGenesisResponse
+	capellaEpoch uint64
 
 	proposerDutiesLock       sync.RWMutex
 	proposerDutiesResponse   *[]byte // raw http response
@@ -176,8 +185,7 @@ type RelayAPI struct {
 
 	blockSimRateLimiter IBlockSimRateLimiter
 
-	activeValidatorC chan boostTypes.PubkeyHex
-	validatorRegC    chan boostTypes.SignedValidatorRegistration
+	validatorRegC chan boostTypes.SignedValidatorRegistration
 
 	// used to wait on any active getPayload calls on shutdown
 	getPayloadCallsInFlight sync.WaitGroup
@@ -189,6 +197,7 @@ type RelayAPI struct {
 	ffLogInvalidSignaturePayload bool // log payload if getPayload signature validation fails
 	ffEnableCancellations        bool // whether to enable block builder cancellations
 	ffRegValContinueOnInvalidSig bool // whether to continue processing further validators if one fails
+	ffIgnorableValidationErrors  bool // whether to enable ignorable validation errors
 
 	payloadAttributes     map[string]payloadAttributesHelper // key:parentBlockHash
 	payloadAttributesLock sync.RWMutex
@@ -265,8 +274,7 @@ func NewRelayAPI(opts RelayAPIOpts) (api *RelayAPI, err error) {
 		proposerDutiesResponse: &[]byte{},
 		blockSimRateLimiter:    NewBlockSimulationRateLimiter(opts.BlockSimURL),
 
-		activeValidatorC: make(chan boostTypes.PubkeyHex, 450_000),
-		validatorRegC:    make(chan boostTypes.SignedValidatorRegistration, 450_000),
+		validatorRegC: make(chan boostTypes.SignedValidatorRegistration, 450_000),
 	}
 
 	if os.Getenv("FORCE_GET_HEADER_204") == "1" {
@@ -297,6 +305,11 @@ func NewRelayAPI(opts RelayAPIOpts) (api *RelayAPI, err error) {
 	if os.Getenv("REGISTER_VALIDATOR_CONTINUE_ON_INVALID_SIG") == "1" {
 		api.log.Warn("env: REGISTER_VALIDATOR_CONTINUE_ON_INVALID_SIG - validator registration will continue processing even if one validator has an invalid signature")
 		api.ffRegValContinueOnInvalidSig = true
+	}
+
+	if os.Getenv("ENABLE_IGNORABLE_VALIDATION_ERRORS") == "1" {
+		api.log.Warn("env: ENABLE_IGNORABLE_VALIDATION_ERRORS - some validation errors will be ignored")
+		api.ffIgnorableValidationErrors = true
 	}
 
 	return api, nil
@@ -358,10 +371,6 @@ func (api *RelayAPI) isCapella(slot uint64) bool {
 	return epoch >= api.capellaEpoch
 }
 
-func (api *RelayAPI) isBellatrix(slot uint64) bool {
-	return !api.isCapella(slot)
-}
-
 // StartServer starts the HTTP server for this instance
 func (api *RelayAPI) StartServer() (err error) {
 	if api.srvStarted.Swap(true) {
@@ -396,21 +405,16 @@ func (api *RelayAPI) StartServer() (err error) {
 	for _, fork := range forkSchedule.Data {
 		api.log.Infof("forkSchedule: version=%s / epoch=%d", fork.CurrentVersion, fork.Epoch)
 		switch fork.CurrentVersion {
-		case api.opts.EthNetDetails.BellatrixForkVersionHex:
-			api.bellatrixEpoch = fork.Epoch
 		case api.opts.EthNetDetails.CapellaForkVersionHex:
 			api.capellaEpoch = fork.Epoch
+			// TODO: add deneb support.
 		}
 	}
 
 	// Print fork version information
+	// TODO: add deneb support.
 	if api.isCapella(currentSlot) {
-		api.log.Infof("capella fork detected (currentEpoch: %d / bellatrixEpoch: %d / capellaEpoch: %d)", currentEpoch, api.bellatrixEpoch, api.capellaEpoch)
-	} else if api.isBellatrix(currentSlot) {
-		api.log.Infof("bellatrix fork detected (currentEpoch: %d / bellatrixEpoch: %d / capellaEpoch: %d)", currentEpoch, api.bellatrixEpoch, api.capellaEpoch)
-		if api.capellaEpoch == 0 {
-			api.log.Infof("no capella fork scheduled. update your beacon-node in time.")
-		}
+		api.log.Infof("capella fork detected (currentEpoch: %d / capellaEpoch: %d)", currentEpoch, api.capellaEpoch)
 	} else {
 		return ErrMismatchedForkVersions
 	}
@@ -423,15 +427,6 @@ func (api *RelayAPI) StartServer() (err error) {
 
 	// start things specific for the proposer API
 	if api.opts.ProposerAPI {
-		// Update list of known validators, and start refresh loop
-		go api.startKnownValidatorUpdates()
-
-		// Start the worker pool to process active validators
-		api.log.Infof("starting %d active validator processors", numActiveValidatorProcessors)
-		for i := 0; i < numActiveValidatorProcessors; i++ {
-			go api.startActiveValidatorProcessor()
-		}
-
 		// Start the validator registration db-save processor
 		api.log.Infof("starting %d validator registration processors", numValidatorRegProcessors)
 		for i := 0; i < numValidatorRegProcessors; i++ {
@@ -503,17 +498,6 @@ func (api *RelayAPI) StopServer() (err error) {
 	return api.srv.Shutdown(context.Background())
 }
 
-// startActiveValidatorProcessor keeps listening on the channel and saving active validators to redis
-func (api *RelayAPI) startActiveValidatorProcessor() {
-	for pubkey := range api.activeValidatorC {
-		err := api.redis.SetActiveValidator(pubkey)
-		if err != nil {
-			api.log.WithError(err).Infof("error setting active validator")
-		}
-	}
-}
-
-// startActiveValidatorProcessor keeps listening on the channel and saving active validators to redis
 func (api *RelayAPI) startValidatorRegistrationDBProcessor() {
 	for valReg := range api.validatorRegC {
 		err := api.datastore.SaveValidatorRegistration(valReg)
@@ -537,14 +521,16 @@ func (api *RelayAPI) simulateBlock(ctx context.Context, opts blockSimOptions) (r
 		"numWaiting": api.blockSimRateLimiter.CurrentCounter(),
 	})
 	if validationErr != nil {
-		// TODO(mikeneuder): consider the negation logic here if it improves readability.
-		ignoreError := validationErr.Error() == ErrBlockAlreadyKnown || validationErr.Error() == ErrBlockRequiresReorg || strings.Contains(validationErr.Error(), ErrMissingTrieNode)
-		if !ignoreError {
-			log.WithError(validationErr).Warn("block validation failed")
-			return nil, validationErr
+		if api.ffIgnorableValidationErrors {
+			// Operators chooses to ignore certain validation errors
+			ignoreError := validationErr.Error() == ErrBlockAlreadyKnown || validationErr.Error() == ErrBlockRequiresReorg || strings.Contains(validationErr.Error(), ErrMissingTrieNode)
+			if ignoreError {
+				log.WithError(validationErr).Warn("block validation failed with ignorable error")
+				return nil, nil
+			}
 		}
-		log.WithError(validationErr).Warn("block validation failed with ignorable error")
-		return nil, nil
+		log.WithError(validationErr).Warn("block validation failed")
+		return nil, validationErr
 	}
 	if requestErr != nil {
 		log.WithError(requestErr).Warn("block validation failed: request error")
@@ -582,7 +568,7 @@ func (api *RelayAPI) demoteBuilder(pubkey string, req *common.BuilderSubmitBlock
 
 // processOptimisticBlock is called on a new goroutine when a optimistic block
 // needs to be simulated.
-func (api *RelayAPI) processOptimisticBlock(opts blockSimOptions) {
+func (api *RelayAPI) processOptimisticBlock(opts blockSimOptions, simResultC chan *blockSimResult) {
 	api.optimisticBlocksInFlight.Add(1)
 	defer func() { api.optimisticBlocksInFlight.Sub(1) }()
 	api.optimisticBlocksWG.Add(1)
@@ -598,6 +584,7 @@ func (api *RelayAPI) processOptimisticBlock(opts blockSimOptions) {
 		"optBlocksInFlight": api.optimisticBlocksInFlight,
 	}).Infof("simulating optimistic block with hash: %v", opts.req.BuilderSubmitBlockRequest.BlockHash())
 	reqErr, simErr := api.simulateBlock(ctx, opts)
+	simResultC <- &blockSimResult{reqErr == nil, true, reqErr, simErr}
 	if reqErr != nil || simErr != nil {
 		// Mark builder as non-optimistic.
 		opts.builder.status.IsOptimistic = false
@@ -698,6 +685,10 @@ func (api *RelayAPI) processNewSlot(headSlot uint64) {
 		go api.prepareBuildersForSlot(headSlot)
 	}
 
+	if api.opts.ProposerAPI {
+		go api.datastore.RefreshKnownValidators(api.beaconClient, headSlot)
+	}
+
 	// log
 	epoch := headSlot / common.SlotsPerEpoch
 	api.log.WithFields(logrus.Fields{
@@ -705,10 +696,6 @@ func (api *RelayAPI) processNewSlot(headSlot uint64) {
 		"slotHead":           headSlot,
 		"slotStartNextEpoch": (epoch + 1) * common.SlotsPerEpoch,
 	}).Infof("updated headSlot to %d", headSlot)
-
-	if api.isBellatrix(prevHeadSlot) && api.isCapella(headSlot) {
-		api.log.Info("====================== NOW ON CAPELLA ======================")
-	}
 }
 
 func (api *RelayAPI) updateProposerDuties(headSlot uint64) {
@@ -795,21 +782,6 @@ func (api *RelayAPI) prepareBuildersForSlot(headSlot uint64) {
 	api.blockBuildersCache = newCache
 }
 
-func (api *RelayAPI) startKnownValidatorUpdates() {
-	for {
-		// Refresh known validators
-		cnt, err := api.datastore.RefreshKnownValidators()
-		if err != nil {
-			api.log.WithError(err).Error("error getting known validators")
-		} else {
-			api.log.WithField("cnt", cnt).Info("updated known validators")
-		}
-
-		// Wait for one epoch (at the beginning, because initially the validators have already been queried)
-		time.Sleep(common.DurationPerEpoch / 2)
-	}
-}
-
 func (api *RelayAPI) RespondError(w http.ResponseWriter, code int, message string) {
 	api.Respond(w, code, HTTPErrorResp{code, message})
 }
@@ -825,6 +797,11 @@ func (api *RelayAPI) RespondMsg(w http.ResponseWriter, code int, msg string) {
 func (api *RelayAPI) Respond(w http.ResponseWriter, code int, response any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
+	if response == nil {
+		return
+	}
+
+	// write the json response
 	if err := json.NewEncoder(w).Encode(response); err != nil {
 		api.log.WithField("response", response).WithError(err).Error("Couldn't write response")
 		http.Error(w, "", http.StatusInternalServerError)
@@ -1001,14 +978,6 @@ func (api *RelayAPI) handleRegisterValidator(w http.ResponseWriter, req *http.Re
 			return
 		}
 
-		// Keep track of active validators
-		numRegActive += 1
-		select {
-		case api.activeValidatorC <- pkHex:
-		default:
-			regLog.Error("active validator channel full")
-		}
-
 		// Check for a previous registration timestamp
 		prevTimestamp, err := api.redis.GetValidatorRegistrationTimestamp(pkHex)
 		if err != nil {
@@ -1124,9 +1093,9 @@ func (api *RelayAPI) handleGetHeader(w http.ResponseWriter, req *http.Request) {
 	}
 
 	// Only allow requests for the current slot until a certain cutoff time
-	if getPayloadRequestCutoffMs > 0 && msIntoSlot > 0 && msIntoSlot > int64(getPayloadRequestCutoffMs) {
+	if getHeaderRequestCutoffMs > 0 && msIntoSlot > 0 && msIntoSlot > int64(getHeaderRequestCutoffMs) {
 		log.Info("getHeader sent too late")
-		api.RespondError(w, http.StatusBadRequest, fmt.Sprintf("sent too late - %d ms into slot", msIntoSlot))
+		w.WriteHeader(http.StatusNoContent)
 		return
 	}
 
@@ -1198,20 +1167,12 @@ func (api *RelayAPI) handleGetPayload(w http.ResponseWriter, req *http.Request) 
 
 	// Decode payload
 	payload := new(common.SignedBlindedBeaconBlock)
-	if api.isCapella(headSlot + 1) {
-		payload.Capella = new(capella.SignedBlindedBeaconBlock)
-		if err := json.NewDecoder(bytes.NewReader(body)).Decode(payload.Capella); err != nil {
-			log.WithError(err).Warn("failed to decode capella getPayload request")
-			api.RespondError(w, http.StatusBadRequest, "failed to decode capella payload")
-			return
-		}
-	} else {
-		payload.Bellatrix = new(boostTypes.SignedBlindedBeaconBlock)
-		if err := json.NewDecoder(bytes.NewReader(body)).Decode(payload.Bellatrix); err != nil {
-			log.WithError(err).Warn("failed to decode bellatrix getPayload request")
-			api.RespondError(w, http.StatusBadRequest, "failed to decode bellatrix payload")
-			return
-		}
+	// TODO: add deneb support.
+	payload.Capella = new(capella.SignedBlindedBeaconBlock)
+	if err := json.NewDecoder(bytes.NewReader(body)).Decode(payload.Capella); err != nil {
+		log.WithError(err).Warn("failed to decode capella getPayload request")
+		api.RespondError(w, http.StatusBadRequest, "failed to decode capella payload")
+		return
 	}
 
 	// Take time after the decoding, and add to logging
@@ -1252,7 +1213,7 @@ func (api *RelayAPI) handleGetPayload(w http.ResponseWriter, req *http.Request) 
 	}
 
 	// Add proposer pubkey to logs
-	log = log.WithField("proposerPubkey", proposerPubkey)
+	log = log.WithField("proposerPubkey", proposerPubkey.String())
 
 	// Create a BLS pubkey from the hex pubkey
 	pk, err := boostTypes.HexToPubkey(proposerPubkey.String())
@@ -1263,29 +1224,16 @@ func (api *RelayAPI) handleGetPayload(w http.ResponseWriter, req *http.Request) 
 	}
 
 	// Validate proposer signature (first attempt verifying the Capella signature)
-	if api.isCapella(headSlot + 1) {
-		ok, err := boostTypes.VerifySignature(payload.Message(), api.opts.EthNetDetails.DomainBeaconProposerCapella, pk[:], payload.Signature())
-		if !ok || err != nil {
-			if api.ffLogInvalidSignaturePayload {
-				txt, _ := json.Marshal(payload) //nolint:errchkjson
-				fmt.Println("payload_invalid_sig_capella: ", string(txt), "pubkey:", proposerPubkey.String())
-			}
-			log.WithError(err).Warn("could not verify capella payload signature")
-			api.RespondError(w, http.StatusBadRequest, "could not verify payload signature")
-			return
+	// TODO: add deneb support.
+	ok, err := boostTypes.VerifySignature(payload.Message(), api.opts.EthNetDetails.DomainBeaconProposerCapella, pk[:], payload.Signature())
+	if !ok || err != nil {
+		if api.ffLogInvalidSignaturePayload {
+			txt, _ := json.Marshal(payload) //nolint:errchkjson
+			fmt.Println("payload_invalid_sig_capella: ", string(txt), "pubkey:", proposerPubkey.String())
 		}
-	} else {
-		// Fall-back to verifying the bellatrix signature
-		ok, err := boostTypes.VerifySignature(payload.Message(), api.opts.EthNetDetails.DomainBeaconProposerBellatrix, pk[:], payload.Signature())
-		if !ok || err != nil {
-			if api.ffLogInvalidSignaturePayload {
-				txt, _ := json.Marshal(payload) //nolint:errchkjson
-				fmt.Println("payload_invalid_sig_bellatrix: ", string(txt), "pubkey:", proposerPubkey.String())
-			}
-			log.WithError(err).Warn("could not verify bellatrix payload signature")
-			api.RespondError(w, http.StatusBadRequest, "could not verify payload signature")
-			return
-		}
+		log.WithError(err).Warn("could not verify capella payload signature")
+		api.RespondError(w, http.StatusBadRequest, "could not verify payload signature")
+		return
 	}
 
 	// Log about received payload (with a valid proposer signature)
@@ -1303,12 +1251,22 @@ func (api *RelayAPI) handleGetPayload(w http.ResponseWriter, req *http.Request) 
 
 		// Try again
 		getPayloadResp, err = api.datastore.GetGetPayloadResponse(payload.Slot(), proposerPubkey.String(), payload.BlockHash())
-		if err != nil {
-			log.WithError(err).Error("failed getting execution payload (2/2) - due to error")
-			api.RespondError(w, http.StatusBadRequest, err.Error())
-			return
-		} else if getPayloadResp == nil {
-			log.Warn("failed getting execution payload (2/2)")
+		if err != nil || getPayloadResp == nil {
+			// Still not found! Error out now.
+			if errors.Is(err, datastore.ErrExecutionPayloadNotFound) {
+				// Couldn't find the execution payload, maybe it never was submitted to our relay! Check that now
+				_, err := api.db.GetBlockSubmissionEntry(payload.Slot(), proposerPubkey.String(), payload.BlockHash())
+				if errors.Is(err, sql.ErrNoRows) {
+					log.Warn("failed getting execution payload (2/2) - payload not found, block was never submitted to this relay")
+					api.RespondError(w, http.StatusBadRequest, "no execution payload for this request - block was never seen by this relay")
+				} else if err != nil {
+					log.WithError(err).Error("failed getting execution payload (2/2) - payload not found, and error on checking bids")
+				} else {
+					log.Error("failed getting execution payload (2/2) - payload not found, but found bid in database")
+				}
+			} else { // some other error
+				log.WithError(err).Error("failed getting execution payload (2/2) - error")
+			}
 			api.RespondError(w, http.StatusBadRequest, "no execution payload for this request")
 			return
 		}
@@ -1330,6 +1288,7 @@ func (api *RelayAPI) handleGetPayload(w http.ResponseWriter, req *http.Request) 
 			// BAD VALIDATOR, 2x GETPAYLOAD FOR PAST SLOT
 			log.Warn("validator called getPayload for past slot")
 			api.RespondError(w, http.StatusBadRequest, "payload for this slot was already delivered")
+			return
 		} else if errors.Is(err, redis.TxFailedErr) {
 			// BAD VALIDATOR, 2x GETPAYLOAD + RACE
 			log.Warn("validator called getPayload twice (race)")
@@ -1402,6 +1361,7 @@ func (api *RelayAPI) handleGetPayload(w http.ResponseWriter, req *http.Request) 
 		bidTrace, err := api.redis.GetBidTrace(payload.Slot(), proposerPubkey.String(), payload.BlockHash())
 		if err != nil {
 			log.WithError(err).Error("failed to get bidTrace for delivered payload from redis")
+			bidTrace = &common.BidTraceV2{} //nolint:exhaustruct
 		}
 
 		err = api.db.SaveDeliveredPayload(bidTrace, payload, decodeTime, msNeededForPublishing)
@@ -1577,6 +1537,7 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 	pf.Decode = uint64(nextTime.Sub(prevTime).Microseconds())
 	prevTime = nextTime
 
+	isLargeRequest := len(requestPayloadBytes) > fastTrackPayloadSizeLimit
 	log = log.WithFields(logrus.Fields{
 		"timestampAfterDecoding": time.Now().UTC().UnixMilli(),
 		"slot":                   payload.Slot(),
@@ -1586,6 +1547,8 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 		"parentHash":             payload.ParentHash(),
 		"value":                  payload.Value().String(),
 		"numTx":                  payload.NumTx(),
+		"payloadBytes":           len(requestPayloadBytes),
+		"isLargeRequest":         isLargeRequest,
 	})
 
 	if payload.Message() == nil || !payload.HasExecutionPayload() {
@@ -1593,13 +1556,10 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 		return
 	}
 
-	if api.isCapella(headSlot+1) && payload.Capella == nil {
+	// TODO: add deneb support.
+	if payload.Capella == nil {
 		log.Info("rejecting submission - non capella payload for capella fork")
 		api.RespondError(w, http.StatusBadRequest, "not capella payload")
-		return
-	} else if api.isBellatrix(headSlot+1) && payload.Bellatrix == nil {
-		log.Info("rejecting submission - non bellatrix payload for bellatrix fork")
-		api.RespondError(w, http.StatusBadRequest, "not belltrix payload")
 		return
 	}
 
@@ -1622,10 +1582,7 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 			collateral: big.NewInt(0),
 		}
 	}
-	log = log.WithFields(logrus.Fields{
-		"builderEntry":      builderEntry,
-		"builderIsHighPrio": builderEntry.status.IsHighPrio,
-	})
+	log = log.WithField("builderIsHighPrio", builderEntry.status.IsHighPrio)
 
 	// Timestamp check
 	expectedTimestamp := api.genesisInfo.Data.GenesisTime + (payload.Slot() * common.SecondsPerSlot)
@@ -1723,14 +1680,21 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 	signature := payload.Signature()
 	ok, err = boostTypes.VerifySignature(payload.Message(), api.opts.EthNetDetails.DomainBuilder, builderPubkey[:], signature[:])
 	log = log.WithField("timestampAfterSignatureCheck", time.Now().UTC().UnixMilli())
-	if !ok || err != nil {
-		log.WithError(err).Warn("could not verify builder signature")
+	if err != nil {
+		log.WithError(err).Warn("failed verifying builder signature")
+		api.RespondError(w, http.StatusBadRequest, "failed verifying builder signature")
+		return
+	} else if !ok {
+		log.Warn("invalid builder signature")
 		api.RespondError(w, http.StatusBadRequest, "invalid signature")
 		return
 	}
 
+	// Create the redis pipeline tx
+	tx := api.redis.NewTxPipeline()
+
 	// Reject new submissions once the payload for this slot was delivered - TODO: store in memory as well
-	slotLastPayloadDelivered, err := api.redis.GetLastSlotDelivered()
+	slotLastPayloadDelivered, err := api.redis.GetLastSlotDelivered(context.Background(), tx)
 	if err != nil && !errors.Is(err, redis.Nil) {
 		log.WithError(err).Error("failed to get delivered payload slot from redis")
 	} else if payload.Slot() <= slotLastPayloadDelivered {
@@ -1739,47 +1703,75 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 		return
 	}
 
-	var wasSimulated, optimisticSubmission bool
-	var requestErr, validationErr error
-	var eligibleAt time.Time
+	// -------------------------------------------------------------------
+	// SUBMISSION SIGNATURE IS VALIDATED AND BID IS GENERALLY LOOKING GOOD
+	// -------------------------------------------------------------------
 
-	// Save the builder submission to the database whenever this function ends
+	// channel to send simulation result to the deferred function
+	simResultC := make(chan *blockSimResult, 1)
+	var eligibleAt time.Time // will be set once the bid is ready
+
+	// Deferred saving of the builder submission to database (whenever this function ends)
 	defer func() {
 		savePayloadToDatabase := !api.ffDisablePayloadDBStorage
-		submissionEntry, err := api.db.SaveBuilderBlockSubmission(payload, requestErr, validationErr, receivedAt, eligibleAt, wasSimulated, savePayloadToDatabase, pf, optimisticSubmission)
+		var simResult *blockSimResult
+		select {
+		case simResult = <-simResultC:
+		case <-time.After(10 * time.Second):
+			log.Warn("timed out waiting for simulation result")
+			simResult = &blockSimResult{false, false, nil, nil}
+		}
+
+		submissionEntry, err := api.db.SaveBuilderBlockSubmission(payload, simResult.requestErr, simResult.validationErr, receivedAt, eligibleAt, simResult.wasSimulated, savePayloadToDatabase, pf, simResult.optimisticSubmission)
 		if err != nil {
 			log.WithError(err).WithField("payload", payload).Error("saving builder block submission to database failed")
 			return
 		}
 
-		err = api.db.UpsertBlockBuilderEntryAfterSubmission(submissionEntry, validationErr != nil)
+		err = api.db.UpsertBlockBuilderEntryAfterSubmission(submissionEntry, simResult.validationErr != nil)
 		if err != nil {
 			log.WithError(err).Error("failed to upsert block-builder-entry")
 		}
 	}()
 
 	// Grab floor bid value
-	floorBidValue, err := api.redis.GetFloorBidValue(payload.Slot(), payload.ParentHash(), payload.ProposerPubkey())
+	floorBidValue, err := api.redis.GetFloorBidValue(context.Background(), tx, payload.Slot(), payload.ParentHash(), payload.ProposerPubkey())
 	if err != nil {
 		log.WithError(err).Error("failed to get floor bid value from redis")
 	} else {
-		isBidAboveFloor := payload.Value().Cmp(floorBidValue) == 1
-		log = log.WithFields(logrus.Fields{
-			"floorBidValue":   floorBidValue.String(),
-			"isBidAboveFloor": isBidAboveFloor,
-		})
+		log = log.WithField("floorBidValue", floorBidValue.String())
+	}
 
-		// Without cancellations, discard bids below floor value
-		if !isCancellationEnabled && !isBidAboveFloor {
-			log.Info("ignoring submission without cancellation and below floor bid value")
-			api.RespondMsg(w, http.StatusAccepted, "ignoring submission without cancellation and below floor bid value")
+	// --------------------------------------------
+	// Skip submission if below the floor bid value
+	// --------------------------------------------
+	isBidBelowFloor := floorBidValue != nil && payload.Value().Cmp(floorBidValue) == -1
+	isBidAtOrBelowFloor := floorBidValue != nil && payload.Value().Cmp(floorBidValue) < 1
+	if isCancellationEnabled && isBidBelowFloor { // with cancellations: if below floor -> delete previous bid
+		simResultC <- &blockSimResult{false, false, nil, nil}
+		log.Info("submission below floor bid value, with cancellation")
+		err := api.redis.DelBuilderBid(context.Background(), tx, payload.Slot(), payload.ParentHash(), payload.ProposerPubkey(), payload.BuilderPubkey().String())
+		if err != nil {
+			log.WithError(err).Error("failed processing cancellable bid below floor")
+			api.RespondError(w, http.StatusInternalServerError, "failed processing cancellable bid below floor")
 			return
 		}
+		api.Respond(w, http.StatusAccepted, "accepted bid below floor, skipped validation")
+		return
+	} else if !isCancellationEnabled && isBidAtOrBelowFloor { // without cancellations: if at or below floor -> ignore
+		simResultC <- &blockSimResult{false, false, nil, nil}
+		log.Info("submission below floor bid value, without cancellation")
+		api.RespondMsg(w, http.StatusAccepted, "accepted bid below floor, skipped validation")
+		return
 	}
+
+	// ---------------------------------
+	// THE BID WILL BE SIMULATED SHORTLY
+	// ---------------------------------
 
 	// Get the latest top bid value from Redis
 	bidIsTopBid := false
-	topBidValue, err := api.redis.GetTopBidValue(payload.Slot(), payload.ParentHash(), payload.ProposerPubkey())
+	topBidValue, err := api.redis.GetTopBidValue(context.Background(), tx, payload.Slot(), payload.ParentHash(), payload.ProposerPubkey())
 	if err != nil {
 		log.WithError(err).Error("failed to get top bid value from redis")
 	} else {
@@ -1791,7 +1783,7 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 	}
 
 	// Simulate the block submission and save to db
-	fastTrackValidation := builderEntry.status.IsHighPrio && bidIsTopBid
+	fastTrackValidation := builderEntry.status.IsHighPrio && bidIsTopBid && !isLargeRequest
 	timeBeforeValidation := time.Now().UTC()
 
 	log = log.WithFields(logrus.Fields{
@@ -1803,7 +1795,7 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 	pf.Prechecks = uint64(nextTime.Sub(prevTime).Microseconds())
 	prevTime = nextTime
 
-	// Construct simulation request.
+	// Construct simulation request
 	opts := blockSimOptions{
 		isHighPrio: builderEntry.status.IsHighPrio,
 		fastTrack:  fastTrackValidation,
@@ -1818,11 +1810,11 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 	if builderEntry.status.IsOptimistic &&
 		builderEntry.collateral.Cmp(payload.Value()) >= 0 &&
 		payload.Slot() == api.optimisticSlot.Load() {
-		optimisticSubmission = true
-		go api.processOptimisticBlock(opts)
+		go api.processOptimisticBlock(opts, simResultC)
 	} else {
-		// Simulate block (synchronously)
-		requestErr, validationErr = api.simulateBlock(req.Context(), opts) // success/error logging happens inside
+		// Simulate block (synchronously).
+		requestErr, validationErr := api.simulateBlock(context.Background(), opts) // success/error logging happens inside
+		simResultC <- &blockSimResult{requestErr == nil, false, requestErr, validationErr}
 		validationDurationMs := time.Since(timeBeforeValidation).Milliseconds()
 		log = log.WithFields(logrus.Fields{
 			"timestampAfterValidation": time.Now().UTC().UnixMilli(),
@@ -1836,7 +1828,6 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 			}
 			return
 		} else {
-			wasSimulated = true
 			if validationErr != nil {
 				api.RespondError(w, http.StatusBadRequest, validationErr.Error())
 				return
@@ -1859,7 +1850,7 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 		// latency will make it impossible to predict which arrives first. Thus a high bid could unintentionally be overwritten by a low bid that happened
 		// to arrive a few microseconds later. If builders are submitting blocks at a frequency where they cannot reliably predict which bid will arrive at
 		// the relay first, they should instead use multiple pubkeys to avoid uninitentionally overwriting their own bids.
-		latestPayloadReceivedAt, err := api.redis.GetBuilderLatestPayloadReceivedAt(payload.Slot(), payload.BuilderPubkey().String(), payload.ParentHash(), payload.ProposerPubkey())
+		latestPayloadReceivedAt, err := api.redis.GetBuilderLatestPayloadReceivedAt(context.Background(), tx, payload.Slot(), payload.BuilderPubkey().String(), payload.ParentHash(), payload.ProposerPubkey())
 		if err != nil {
 			log.WithError(err).Error("failed getting latest payload receivedAt from redis")
 		} else if receivedAt.UnixMilli() < latestPayloadReceivedAt {
@@ -1893,30 +1884,23 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 	//
 	// Save to Redis
 	//
-	// 1. Save BidTrace
-	log = log.WithField("timestampBeforeUpdateTopBid", time.Now().UTC().UnixMilli())
-	err = api.redis.SaveBidTrace(&bidTrace)
-	if err != nil {
-		log.WithError(err).Error("failed saving bidTrace in redis")
-		api.RespondError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-
-	// 2. Save bid and recalculate top bid
-	updateBidResult, err := api.redis.SaveBidAndUpdateTopBid(payload, getPayloadResponse, getHeaderResponse, receivedAt, isCancellationEnabled, floorBidValue)
+	updateBidResult, err := api.redis.SaveBidAndUpdateTopBid(context.Background(), tx, &bidTrace, payload, getPayloadResponse, getHeaderResponse, receivedAt, isCancellationEnabled, floorBidValue)
 	if err != nil {
 		log.WithError(err).Error("could not save bid and update top bids")
-		api.RespondError(w, http.StatusInternalServerError, err.Error())
+		api.RespondError(w, http.StatusInternalServerError, "failed saving and updating bid")
 		return
 	}
 
 	// Add fields to logs
 	log = log.WithFields(logrus.Fields{
-		"wasBidSavedInRedis":      updateBidResult.WasBidSaved,
-		"wasTopBidUpdated":        updateBidResult.WasTopBidUpdated,
-		"topBidValue":             updateBidResult.TopBidValue,
-		"prevTopBidValue":         updateBidResult.PrevTopBidValue,
-		"timestampAfterBidUpdate": time.Now().UTC().UnixMilli(),
+		"timestampAfterBidUpdate":    time.Now().UTC().UnixMilli(),
+		"wasBidSavedInRedis":         updateBidResult.WasBidSaved,
+		"wasTopBidUpdated":           updateBidResult.WasTopBidUpdated,
+		"topBidValue":                updateBidResult.TopBidValue,
+		"prevTopBidValue":            updateBidResult.PrevTopBidValue,
+		"profileRedisSavePayloadUs":  updateBidResult.TimeSavePayload.Microseconds(),
+		"profileRedisUpdateTopBidUs": updateBidResult.TimeUpdateTopBid.Microseconds(),
+		"profileRedisUpdateFloorUs":  updateBidResult.TimeUpdateFloor.Microseconds(),
 	})
 
 	if updateBidResult.WasBidSaved {
@@ -1939,9 +1923,14 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 	pf.RedisUpdate = uint64(nextTime.Sub(prevTime).Microseconds())
 	pf.Total = uint64(nextTime.Sub(receivedAt).Microseconds())
 
-	// Respond with OK (TODO: proper response data type https://flashbots.notion.site/Relay-API-Spec-5fb0819366954962bc02e81cb33840f5#fa719683d4ae4a57bc3bf60e138b0dc6)
-	// All done
-	log.Info("received block from builder")
+	// All done, log with profiling information
+	log.WithFields(logrus.Fields{
+		"profileDecodeUs":    pf.Decode,
+		"profilePrechecksUs": pf.Prechecks,
+		"profileSimUs":       pf.Simulation,
+		"profileRedisUs":     pf.RedisUpdate,
+		"profileTotalUs":     pf.Total,
+	}).Info("received block from builder")
 	w.WriteHeader(http.StatusOK)
 }
 

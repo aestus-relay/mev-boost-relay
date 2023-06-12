@@ -1,12 +1,31 @@
 package datastore
 
 import (
+	"context"
+	"errors"
 	"math/big"
+
+	"github.com/go-redis/redis/v9"
 )
 
 // BuilderBids supports redis.SaveBidAndUpdateTopBid
 type BuilderBids struct {
 	bidValues map[string]*big.Int
+}
+
+func NewBuilderBidsFromRedis(ctx context.Context, r *RedisCache, tx redis.Pipeliner, slot uint64, parentHash, proposerPubkey string) (*BuilderBids, error) {
+	keyBidValues := r.keyBlockBuilderLatestBidsValue(slot, parentHash, proposerPubkey)
+	c := tx.HGetAll(ctx, keyBidValues)
+	_, err := tx.Exec(ctx)
+	if err != nil && !errors.Is(err, redis.Nil) {
+		return nil, err
+	}
+
+	bidValueMap, err := c.Result()
+	if err != nil {
+		return nil, err
+	}
+	return NewBuilderBids(bidValueMap), nil
 }
 
 func NewBuilderBids(bidValueMap map[string]string) *BuilderBids {

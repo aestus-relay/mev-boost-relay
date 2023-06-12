@@ -20,6 +20,7 @@ Alternatives (not audited or endorsed): [blocknative/dreamboat](https://github.c
 * [mev-boost](https://github.com/flashbots/mev-boost)
 * [Relay API specs](https://flashbots.github.io/relay-specs)
 * [Guide for running mev-boost-relay at scale](https://flashbots.notion.site/Running-mev-boost-relay-at-scale-draft-4040ccd5186c425d9a860cbb29bbfe09)
+* [Running relay and builders in custom devnets](https://gist.github.com/metachris/66df812f2920e6b0047afb9fdaf7df91#using-unnamed-devnets)
 
 ### Components
 
@@ -27,7 +28,7 @@ The relay consists of three main components, which are designed to run and scale
 
 1. [API](https://github.com/flashbots/mev-boost-relay/tree/main/services/api): Services that provide APIs for (a) proposers, (b) block builders, (c) data.
 1. [Website](https://github.com/flashbots/mev-boost-relay/tree/main/services/website): Serving the [website requests](https://boost-relay.flashbots.net/) (information is pulled from Redis and database).
-1. [Housekeeper](https://github.com/flashbots/mev-boost-relay/tree/main/services/housekeeper): Service that updates known validators, proposer duties, and more in the background. Only a single instance of this should run.
+1. [Housekeeper](https://github.com/flashbots/mev-boost-relay/tree/main/services/housekeeper): Updates known validators, proposer duties, and more in the background. Only a single instance of this should run.
 
 ### Dependencies
 
@@ -106,7 +107,7 @@ go run . website --network sepolia --db postgres://postgres:postgres@localhost:5
 curl localhost:9062/eth/v1/builder/status
 
 # Send test validator registrations
-curl -X POST localhost:9062/eth/v1/builder/validators -d @testdata/valreg2.json
+curl -X POST -H'Content-Encoding: gzip' localhost:9062/eth/v1/builder/validators --data-binary @testdata/valreg2.json.gz
 
 # Delete previous registrations
 redis-cli DEL boost-relay/sepolia:validators-registration boost-relay/sepolia:validators-registration-timestamp
@@ -144,12 +145,17 @@ redis-cli DEL boost-relay/sepolia:validators-registration boost-relay/sepolia:va
 * `DISABLE_PAYLOAD_DATABASE_STORAGE` - builder API - disable storing execution payloads in the database (i.e. when using memcached as data availability redundancy)
 * `DISABLE_LOWPRIO_BUILDERS` - reject block submissions by low-prio builders
 * `FORCE_GET_HEADER_204` - force 204 as getHeader response
+* `ENABLE_IGNORABLE_VALIDATION_ERRORS` - enable ignorable validation errors
 
 #### Development Environment Variables
 
 * `RUN_DB_TESTS` - when set to "1" enables integration tests with Postgres using endpoint specified by environment variable `TEST_DB_DSN`
 * `RUN_INTEGRATION_TESTS` - when set to "1" enables integration tests, currently used for testing Memcached using comma separated list of endpoints specified by `MEMCACHED_URIS`
 * `TEST_DB_DSN` - specifies connection string using Data Source Name (DSN) for Postgres (default: postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable)
+
+#### Redis tuning
+
+* `REDIS_CONNECTION_POOL_SIZE`, `REDIS_MIN_IDLE_CONNECTIONS`, `REDIS_READ_TIMEOUT_SEC`, `REDIS_POOL_TIMEOUT_SEC`, `REDIS_WRITE_TIMEOUT_SEC` (see also [the code here](https://github.com/flashbots/mev-boost-relay/blob/e39cd38010de26bf9a51d1a3e77fc235ea87b12f/datastore/redis.go#L35-L41))
 
 ## Updating the website
 
