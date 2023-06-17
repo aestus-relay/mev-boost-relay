@@ -13,7 +13,7 @@ ADD . .
 RUN --mount=type=cache,target=/root/.cache/go-build GOOS=linux go build -trimpath -ldflags "-s -X cmd.Version=$VERSION -X main.Version=$VERSION" -v -o mev-boost-relay .
 
 # Copy to executable container
-FROM debian:11
+FROM golang:1.20
 WORKDIR /app
 COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
 COPY --from=builder /build/mev-boost-relay /app/mev-boost-relay
