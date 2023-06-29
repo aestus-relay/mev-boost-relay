@@ -370,8 +370,8 @@ func (r *RedisCache) SaveExecutionPayloadCapella(ctx context.Context, pipeliner 
 	return r.SetPL(ctx, pipeliner, key, b, expiryBidCache)
 }
 
-func (r *RedisCache) GetExecutionPayloadCapella(slot uint64, proposerPubkey, blockHash string) (*common.VersionedExecutionPayload, error) {
-	resp := new(common.VersionedExecutionPayload)
+func (r *RedisCache) GetExecutionPayloadCapella(slot uint64, proposerPubkey, blockHash string) (*api.VersionedExecutionPayload, error) {
+	resp := new(api.VersionedExecutionPayload)
 	capellaPayload := new(capella.ExecutionPayload)
 
 	key := r.keyExecPayloadCapella(slot, proposerPubkey, blockHash)
@@ -385,9 +385,8 @@ func (r *RedisCache) GetExecutionPayloadCapella(slot uint64, proposerPubkey, blo
 		return nil, err
 	}
 
-	resp.Capella = new(api.VersionedExecutionPayload)
-	resp.Capella.Capella = capellaPayload
-	resp.Capella.Version = consensusspec.DataVersionCapella
+	resp.Capella = capellaPayload
+	resp.Version = consensusspec.DataVersionCapella
 	return resp, nil
 }
 
