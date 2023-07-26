@@ -385,7 +385,7 @@ func (r *RedisCache) GetExecutionPayloadCapella(slot uint64, proposerPubkey, blo
 		return nil, err
 	}
 
-	return &api.VersionedExecutionPayload{ //nolint:exhaustruct
+	return &api.VersionedExecutionPayload{
 		Version: consensusspec.DataVersionCapella,
 		Capella: capellaPayload,
 	}, nil
