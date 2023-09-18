@@ -15,6 +15,8 @@ import (
 	"github.com/alicebob/miniredis/v2"
 	builderCapella "github.com/attestantio/go-builder-client/api/capella"
 	v1 "github.com/attestantio/go-builder-client/api/v1"
+	"github.com/attestantio/go-eth2-client/spec/bellatrix"
+	"github.com/attestantio/go-eth2-client/spec/capella"
 	"github.com/attestantio/go-eth2-client/spec/phase0"
 	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/flashbots/go-boost-utils/bls"
@@ -24,10 +26,24 @@ import (
 	"github.com/flashbots/mev-boost-relay/database"
 	"github.com/flashbots/mev-boost-relay/datastore"
 	"github.com/holiman/uint256"
+	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/require"
 )
 
-var builderSigningDomain = types.Domain([32]byte{0, 0, 0, 1, 245, 165, 253, 66, 209, 106, 32, 48, 39, 152, 239, 110, 211, 9, 151, 155, 67, 0, 61, 35, 32, 217, 240, 232, 234, 152, 49, 169})
+const (
+	testGasLimit        = uint64(30000000)
+	testSlot            = uint64(42)
+	testParentHash      = "0xbd3291854dc822b7ec585925cda0e18f06af28fa2886e15f52d52dd4b6f94ed6"
+	testWithdrawalsRoot = "0x7f6d156912a4cb1e74ee37e492ad883f7f7ac856d987b3228b517e490aa0189e"
+	testPrevRandao      = "0x9962816e9d0a39fd4c80935338a741dc916d1545694e41eb5a505e1a3098f9e4"
+	testBuilderPubkey   = "0xfa1ed37c3553d0ce1e9349b2c5063cf6e394d231c8d3e0df75e9462257c081543086109ffddaacc0aa76f33dc9661c83"
+)
+
+var (
+	builderSigningDomain = types.Domain([32]byte{0, 0, 0, 1, 245, 165, 253, 66, 209, 106, 32, 48, 39, 152, 239, 110, 211, 9, 151, 155, 67, 0, 61, 35, 32, 217, 240, 232, 234, 152, 49, 169})
+	testAddress          = types.Address([20]byte{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19})
+	testAddress2         = types.Address([20]byte{1, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19})
+)
 
 type testBackend struct {
 	t         require.TestingT
@@ -45,7 +61,7 @@ func newTestBackend(t require.TestingT, numBeaconNodes int) *testBackend {
 
 	db := database.MockDB{}
 
-	ds, err := datastore.NewDatastore(common.TestLog, redisCache, nil, db)
+	ds, err := datastore.NewDatastore(redisCache, nil, db)
 	require.NoError(t, err)
 
 	sk, _, err := bls.GenerateNewKeypair()
@@ -197,6 +213,14 @@ func TestStatus(t *testing.T) {
 	path := "/eth/v1/builder/status"
 	rr := backend.request(http.MethodGet, path, common.ValidPayloadRegisterValidator)
 	require.Equal(t, http.StatusOK, rr.Code)
+}
+
+func TestLivez(t *testing.T) {
+	backend := newTestBackend(t, 1)
+	path := "/livez"
+	rr := backend.request(http.MethodGet, path, nil)
+	require.Equal(t, http.StatusOK, rr.Code)
+	require.Equal(t, "{\"message\":\"live\"}\n", rr.Body.String())
 }
 
 func TestRegisterValidator(t *testing.T) {
@@ -405,7 +429,8 @@ func TestBuilderSubmitBlock(t *testing.T) {
 
 	// Setup the test relay backend
 	backend.relay.headSlot.Store(headSlot)
-	backend.relay.capellaEpoch = 1
+	backend.relay.capellaEpoch = 0
+	backend.relay.denebEpoch = 1
 	backend.relay.proposerDutiesMap = make(map[uint64]*common.BuilderGetValidatorsResponseEntry)
 	backend.relay.proposerDutiesMap[headSlot+1] = &common.BuilderGetValidatorsResponseEntry{
 		Slot: headSlot,
@@ -478,6 +503,522 @@ func TestBuilderSubmitBlock(t *testing.T) {
 	rr = backend.requestBytes(http.MethodPost, path, sszGzip, headers)
 	require.Contains(t, rr.Body.String(), "invalid signature")
 	require.Equal(t, http.StatusBadRequest, rr.Code)
+}
+
+func TestCheckSubmissionFeeRecipient(t *testing.T) {
+	cases := []struct {
+		description    string
+		slotDuty       *common.BuilderGetValidatorsResponseEntry
+		payload        *common.BuilderSubmitBlockRequest
+		expectOk       bool
+		expectGasLimit uint64
+	}{
+		{
+			description: "success",
+			slotDuty: &common.BuilderGetValidatorsResponseEntry{
+				Entry: &types.SignedValidatorRegistration{
+					Message: &types.RegisterValidatorRequestMessage{
+						FeeRecipient: testAddress,
+						GasLimit:     testGasLimit,
+					},
+				},
+			},
+			payload: &common.BuilderSubmitBlockRequest{
+				Capella: &builderCapella.SubmitBlockRequest{
+					Message: &v1.BidTrace{
+						Slot:                 testSlot,
+						ProposerFeeRecipient: bellatrix.ExecutionAddress(testAddress),
+					},
+				},
+			},
+			expectOk:       true,
+			expectGasLimit: testGasLimit,
+		},
+		{
+			description: "failure_nil_slot_duty",
+			slotDuty:    nil,
+			payload: &common.BuilderSubmitBlockRequest{
+				Capella: &builderCapella.SubmitBlockRequest{
+					Message: &v1.BidTrace{
+						Slot: testSlot,
+					},
+				},
+			},
+			expectOk:       false,
+			expectGasLimit: 0,
+		},
+		{
+			description: "failure_diff_fee_recipient",
+			slotDuty: &common.BuilderGetValidatorsResponseEntry{
+				Entry: &types.SignedValidatorRegistration{
+					Message: &types.RegisterValidatorRequestMessage{
+						FeeRecipient: testAddress,
+						GasLimit:     testGasLimit,
+					},
+				},
+			},
+			payload: &common.BuilderSubmitBlockRequest{
+				Capella: &builderCapella.SubmitBlockRequest{
+					Message: &v1.BidTrace{
+						Slot:                 testSlot,
+						ProposerFeeRecipient: bellatrix.ExecutionAddress(testAddress2),
+					},
+				},
+			},
+			expectOk:       false,
+			expectGasLimit: 0,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.description, func(t *testing.T) {
+			_, _, backend := startTestBackend(t)
+			backend.relay.proposerDutiesLock.RLock()
+			backend.relay.proposerDutiesMap[tc.payload.Slot()] = tc.slotDuty
+			backend.relay.proposerDutiesLock.RUnlock()
+
+			w := httptest.NewRecorder()
+			logger := logrus.New()
+			log := logrus.NewEntry(logger)
+			gasLimit, ok := backend.relay.checkSubmissionFeeRecipient(w, log, tc.payload)
+			require.Equal(t, tc.expectGasLimit, gasLimit)
+			require.Equal(t, tc.expectOk, ok)
+		})
+	}
+}
+
+func TestCheckSubmissionPayloadAttrs(t *testing.T) {
+	withdrawalsRoot, err := hexutil.Decode(testWithdrawalsRoot)
+	require.NoError(t, err)
+	prevRandao, err := hexutil.Decode(testPrevRandao)
+	require.NoError(t, err)
+	parentHash, err := hexutil.Decode(testParentHash)
+	require.NoError(t, err)
+
+	cases := []struct {
+		description string
+		attrs       payloadAttributesHelper
+		payload     *common.BuilderSubmitBlockRequest
+		expectOk    bool
+	}{
+		{
+			description: "success",
+			attrs: payloadAttributesHelper{
+				slot:            testSlot,
+				parentHash:      testParentHash,
+				withdrawalsRoot: phase0.Root(withdrawalsRoot),
+				payloadAttributes: beaconclient.PayloadAttributes{
+					PrevRandao: testPrevRandao,
+				},
+			},
+			payload: &common.BuilderSubmitBlockRequest{
+				Capella: &builderCapella.SubmitBlockRequest{
+					ExecutionPayload: &capella.ExecutionPayload{
+						PrevRandao: [32]byte(prevRandao),
+						Withdrawals: []*capella.Withdrawal{
+							{
+								Index: 989694,
+							},
+						},
+					},
+					Message: &v1.BidTrace{
+						Slot:       testSlot,
+						ParentHash: phase0.Hash32(parentHash),
+					},
+				},
+			},
+			expectOk: true,
+		},
+		{
+			description: "failure_attrs_not_known",
+			attrs: payloadAttributesHelper{
+				slot: testSlot,
+			},
+			payload: &common.BuilderSubmitBlockRequest{
+				Capella: &builderCapella.SubmitBlockRequest{
+					Message: &v1.BidTrace{
+						Slot: testSlot + 1, // submission for a future slot
+					},
+				},
+			},
+			expectOk: false,
+		},
+		{
+			description: "failure_wrong_prev_randao",
+			attrs: payloadAttributesHelper{
+				slot: testSlot,
+				payloadAttributes: beaconclient.PayloadAttributes{
+					PrevRandao: testPrevRandao,
+				},
+			},
+			payload: &common.BuilderSubmitBlockRequest{
+				Capella: &builderCapella.SubmitBlockRequest{
+					Message: &v1.BidTrace{
+						Slot:       testSlot,
+						ParentHash: phase0.Hash32(parentHash),
+					},
+					ExecutionPayload: &capella.ExecutionPayload{
+						PrevRandao: [32]byte(parentHash), // use a different hash to cause an error
+					},
+				},
+			},
+			expectOk: false,
+		},
+		{
+			description: "failure_nil_withdrawals",
+			attrs: payloadAttributesHelper{
+				slot: testSlot,
+				payloadAttributes: beaconclient.PayloadAttributes{
+					PrevRandao: testPrevRandao,
+				},
+			},
+			payload: &common.BuilderSubmitBlockRequest{
+				Capella: &builderCapella.SubmitBlockRequest{
+					Message: &v1.BidTrace{
+						Slot:       testSlot,
+						ParentHash: phase0.Hash32(parentHash),
+					},
+					ExecutionPayload: &capella.ExecutionPayload{
+						PrevRandao:  [32]byte(prevRandao),
+						Withdrawals: nil, // set to nil to cause an error
+					},
+				},
+			},
+			expectOk: false,
+		},
+		{
+			description: "failure_wrong_withdrawal_root",
+			attrs: payloadAttributesHelper{
+				slot:            testSlot,
+				parentHash:      testParentHash,
+				withdrawalsRoot: phase0.Root(prevRandao), // use different root to cause an error
+				payloadAttributes: beaconclient.PayloadAttributes{
+					PrevRandao: testPrevRandao,
+				},
+			},
+			payload: &common.BuilderSubmitBlockRequest{
+				Capella: &builderCapella.SubmitBlockRequest{
+					ExecutionPayload: &capella.ExecutionPayload{
+						PrevRandao: [32]byte(prevRandao),
+						Withdrawals: []*capella.Withdrawal{
+							{
+								Index: 989694,
+							},
+						},
+					},
+					Message: &v1.BidTrace{
+						Slot:       testSlot,
+						ParentHash: phase0.Hash32(parentHash),
+					},
+				},
+			},
+			expectOk: false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.description, func(t *testing.T) {
+			_, _, backend := startTestBackend(t)
+			backend.relay.payloadAttributesLock.RLock()
+			backend.relay.payloadAttributes[testParentHash] = tc.attrs
+			backend.relay.payloadAttributesLock.RUnlock()
+
+			w := httptest.NewRecorder()
+			logger := logrus.New()
+			log := logrus.NewEntry(logger)
+			ok := backend.relay.checkSubmissionPayloadAttrs(w, log, tc.payload)
+			require.Equal(t, tc.expectOk, ok)
+		})
+	}
+}
+
+func TestCheckSubmissionSlotDetails(t *testing.T) {
+	cases := []struct {
+		description string
+		payload     *common.BuilderSubmitBlockRequest
+		expectOk    bool
+	}{
+		{
+			description: "success",
+			payload: &common.BuilderSubmitBlockRequest{
+				Capella: &builderCapella.SubmitBlockRequest{
+					ExecutionPayload: &capella.ExecutionPayload{
+						Timestamp: testSlot * common.SecondsPerSlot,
+					},
+					Message: &v1.BidTrace{
+						Slot: testSlot,
+					},
+				},
+			},
+			expectOk: true,
+		},
+		{
+			description: "failure_nil_capella",
+			payload: &common.BuilderSubmitBlockRequest{
+				Capella: nil, // nil to cause error
+			},
+			expectOk: false,
+		},
+		{
+			description: "failure_past_slot",
+			payload: &common.BuilderSubmitBlockRequest{
+				Capella: &builderCapella.SubmitBlockRequest{
+					Message: &v1.BidTrace{
+						Slot: testSlot - 1, // use old slot to cause error
+					},
+				},
+			},
+			expectOk: false,
+		},
+		{
+			description: "failure_wrong_timestamp",
+			payload: &common.BuilderSubmitBlockRequest{
+				Capella: &builderCapella.SubmitBlockRequest{
+					ExecutionPayload: &capella.ExecutionPayload{
+						Timestamp: testSlot*common.SecondsPerSlot - 1, // use wrong timestamp to cause error
+					},
+					Message: &v1.BidTrace{
+						Slot: testSlot,
+					},
+				},
+			},
+			expectOk: false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.description, func(t *testing.T) {
+			_, _, backend := startTestBackend(t)
+
+			headSlot := testSlot - 1
+			w := httptest.NewRecorder()
+			logger := logrus.New()
+			log := logrus.NewEntry(logger)
+			ok := backend.relay.checkSubmissionSlotDetails(w, log, headSlot, tc.payload)
+			require.Equal(t, tc.expectOk, ok)
+		})
+	}
+}
+
+func TestCheckBuilderEntry(t *testing.T) {
+	builderPubkeyByte, err := hexutil.Decode(testBuilderPubkey)
+	require.NoError(t, err)
+	builderPubkey := phase0.BLSPubKey(builderPubkeyByte)
+	diffPubkey := builderPubkey
+	diffPubkey[0] = 0xff
+	cases := []struct {
+		description string
+		entry       *blockBuilderCacheEntry
+		pk          phase0.BLSPubKey
+		expectOk    bool
+	}{
+		{
+			description: "success",
+			entry: &blockBuilderCacheEntry{
+				status: common.BuilderStatus{
+					IsHighPrio: true,
+				},
+			},
+			pk:       builderPubkey,
+			expectOk: true,
+		},
+		{
+			description: "failure_blacklisted",
+			entry: &blockBuilderCacheEntry{
+				status: common.BuilderStatus{
+					IsBlacklisted: true, // set blacklisted to true to cause failure
+				},
+			},
+			pk:       builderPubkey,
+			expectOk: false,
+		},
+		{
+			description: "failure_low_prio",
+			entry: &blockBuilderCacheEntry{
+				status: common.BuilderStatus{
+					IsHighPrio: false, // set low-prio to cause failure
+				},
+			},
+			pk:       builderPubkey,
+			expectOk: false,
+		},
+		{
+			description: "failure_nil_entry_low_prio",
+			entry:       nil,
+			pk:          diffPubkey, // set to different pubkey, so no entry is found
+			expectOk:    false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.description, func(t *testing.T) {
+			_, _, backend := startTestBackend(t)
+			backend.relay.blockBuildersCache[tc.pk.String()] = tc.entry
+			backend.relay.ffDisableLowPrioBuilders = true
+			w := httptest.NewRecorder()
+			logger := logrus.New()
+			log := logrus.NewEntry(logger)
+			_, ok := backend.relay.checkBuilderEntry(w, log, builderPubkey)
+			require.Equal(t, tc.expectOk, ok)
+		})
+	}
+}
+
+func TestCheckFloorBidValue(t *testing.T) {
+	cases := []struct {
+		description          string
+		payload              *common.BuilderSubmitBlockRequest
+		cancellationsEnabled bool
+		floorValue           string
+		expectOk             bool
+	}{
+		{
+			description: "success",
+			payload: &common.BuilderSubmitBlockRequest{
+				Capella: &builderCapella.SubmitBlockRequest{
+					Message: &v1.BidTrace{
+						Slot:  testSlot,
+						Value: uint256.NewInt(1),
+					},
+				},
+			},
+			expectOk: true,
+		},
+		{
+			description: "failure_slot_already_delivered",
+			payload: &common.BuilderSubmitBlockRequest{
+				Capella: &builderCapella.SubmitBlockRequest{
+					Message: &v1.BidTrace{
+						Slot: 0,
+					},
+				},
+			},
+			expectOk: false,
+		},
+		{
+			description: "failure_cancellations_below_floor",
+			payload: &common.BuilderSubmitBlockRequest{
+				Capella: &builderCapella.SubmitBlockRequest{
+					Message: &v1.BidTrace{
+						Slot:  testSlot,
+						Value: uint256.NewInt(1),
+					},
+				},
+			},
+			expectOk:             false,
+			cancellationsEnabled: true,
+			floorValue:           "2",
+		},
+		{
+			description: "failure_no_cancellations_at_floor",
+			payload: &common.BuilderSubmitBlockRequest{
+				Capella: &builderCapella.SubmitBlockRequest{
+					Message: &v1.BidTrace{
+						Slot:  testSlot,
+						Value: uint256.NewInt(0),
+					},
+				},
+			},
+			expectOk: false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.description, func(t *testing.T) {
+			_, _, backend := startTestBackend(t)
+			err := backend.redis.SetFloorBidValue(tc.payload.Slot(), tc.payload.ParentHash(), tc.payload.ProposerPubkey(), tc.floorValue)
+			require.Nil(t, err)
+
+			w := httptest.NewRecorder()
+			logger := logrus.New()
+			log := logrus.NewEntry(logger)
+			tx := backend.redis.NewTxPipeline()
+			simResultC := make(chan *blockSimResult, 1)
+			bfOpts := bidFloorOpts{
+				w:                    w,
+				tx:                   tx,
+				log:                  log,
+				cancellationsEnabled: tc.cancellationsEnabled,
+				simResultC:           simResultC,
+				payload:              tc.payload,
+			}
+			floor, ok := backend.relay.checkFloorBidValue(bfOpts)
+			require.Equal(t, tc.expectOk, ok)
+			if ok {
+				require.NotNil(t, floor)
+				require.NotNil(t, log)
+			}
+		})
+	}
+}
+
+func TestUpdateRedis(t *testing.T) {
+	cases := []struct {
+		description          string
+		cancellationsEnabled bool
+		floorValue           string
+		payload              *common.BuilderSubmitBlockRequest
+		expectOk             bool
+	}{
+		{
+			description: "success",
+			floorValue:  "10",
+			payload: &common.BuilderSubmitBlockRequest{
+				Capella: &builderCapella.SubmitBlockRequest{
+					Message: &v1.BidTrace{
+						Slot:  testSlot,
+						Value: uint256.NewInt(1),
+					},
+					ExecutionPayload: &capella.ExecutionPayload{},
+				},
+			},
+			expectOk: true,
+		},
+		{
+			description: "failure_no_payload",
+			floorValue:  "10",
+			payload:     nil,
+			expectOk:    false,
+		},
+		{
+			description: "failure_encode_failure_too_long_extra_data",
+			floorValue:  "10",
+			payload: &common.BuilderSubmitBlockRequest{
+				Capella: &builderCapella.SubmitBlockRequest{
+					Message: &v1.BidTrace{
+						Slot:  testSlot,
+						Value: uint256.NewInt(1),
+					},
+					ExecutionPayload: &capella.ExecutionPayload{
+						ExtraData: make([]byte, 33), // Max extra data length is 32.
+					},
+				},
+			},
+			expectOk: false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.description, func(t *testing.T) {
+			_, _, backend := startTestBackend(t)
+			w := httptest.NewRecorder()
+			logger := logrus.New()
+			log := logrus.NewEntry(logger)
+			tx := backend.redis.NewTxPipeline()
+
+			floorValue := new(big.Int)
+			floorValue, ok := floorValue.SetString(tc.floorValue, 10)
+			require.True(t, ok)
+			rOpts := redisUpdateBidOpts{
+				w:                    w,
+				tx:                   tx,
+				log:                  log,
+				cancellationsEnabled: tc.cancellationsEnabled,
+				floorBidValue:        floorValue,
+				payload:              tc.payload,
+			}
+			updateResp, getPayloadResp, ok := backend.relay.updateRedisBid(rOpts)
+			require.Equal(t, tc.expectOk, ok)
+			if ok {
+				require.NotNil(t, updateResp)
+				require.NotNil(t, getPayloadResp)
+			}
+		})
+	}
 }
 
 func gzipBytes(t *testing.T, b []byte) []byte {

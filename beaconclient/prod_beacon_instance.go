@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
 	"time"
 
 	"github.com/attestantio/go-eth2-client/spec/capella"
@@ -16,6 +17,9 @@ import (
 type ProdBeaconInstance struct {
 	log       *logrus.Entry
 	beaconURI string
+
+	// feature flags
+	ffUseV2PublishBlockEndpoint bool
 }
 
 func NewProdBeaconInstance(log *logrus.Entry, beaconURI string) *ProdBeaconInstance {
@@ -23,7 +27,16 @@ func NewProdBeaconInstance(log *logrus.Entry, beaconURI string) *ProdBeaconInsta
 		"component": "beaconInstance",
 		"beaconURI": beaconURI,
 	})
-	return &ProdBeaconInstance{_log, beaconURI}
+
+	client := &ProdBeaconInstance{_log, beaconURI, false}
+
+	// feature flags
+	if os.Getenv("USE_V2_PUBLISH_BLOCK_ENDPOINT") != "" {
+		_log.Warn("env: USE_V2_PUBLISH_BLOCK_ENDPOINT: use the v2 publish block endpoint")
+		client.ffUseV2PublishBlockEndpoint = true
+	}
+
+	return client
 }
 
 // HeadEventData represents the data of a head event
@@ -138,7 +151,7 @@ type ValidatorResponseValidatorData struct {
 func (c *ProdBeaconInstance) GetStateValidators(stateID string) (*GetStateValidatorsResponse, error) {
 	uri := fmt.Sprintf("%s/eth/v1/beacon/states/%s/validators?status=active,pending", c.beaconURI, stateID)
 	vd := new(GetStateValidatorsResponse)
-	_, err := fetchBeacon(http.MethodGet, uri, nil, vd, nil)
+	_, err := fetchBeacon(http.MethodGet, uri, nil, vd, nil, http.Header{})
 	return vd, err
 }
 
@@ -159,7 +172,7 @@ func (c *ProdBeaconInstance) SyncStatus() (*SyncStatusPayloadData, error) {
 	uri := c.beaconURI + "/eth/v1/node/syncing"
 	timeout := 5 * time.Second
 	resp := new(SyncStatusPayload)
-	_, err := fetchBeacon(http.MethodGet, uri, nil, resp, &timeout)
+	_, err := fetchBeacon(http.MethodGet, uri, nil, resp, &timeout, http.Header{})
 	if err != nil {
 		return nil, err
 	}
@@ -189,7 +202,7 @@ type ProposerDutiesResponseData struct {
 func (c *ProdBeaconInstance) GetProposerDuties(epoch uint64) (*ProposerDutiesResponse, error) {
 	uri := fmt.Sprintf("%s/eth/v1/validator/duties/proposer/%d", c.beaconURI, epoch)
 	resp := new(ProposerDutiesResponse)
-	_, err := fetchBeacon(http.MethodGet, uri, nil, resp, nil)
+	_, err := fetchBeacon(http.MethodGet, uri, nil, resp, nil, http.Header{})
 	return resp, err
 }
 
@@ -212,7 +225,7 @@ type GetHeaderResponseMessage struct {
 func (c *ProdBeaconInstance) GetHeader() (*GetHeaderResponse, error) {
 	uri := fmt.Sprintf("%s/eth/v1/beacon/headers/head", c.beaconURI)
 	resp := new(GetHeaderResponse)
-	_, err := fetchBeacon(http.MethodGet, uri, nil, resp, nil)
+	_, err := fetchBeacon(http.MethodGet, uri, nil, resp, nil, http.Header{})
 	return resp, err
 }
 
@@ -220,7 +233,7 @@ func (c *ProdBeaconInstance) GetHeader() (*GetHeaderResponse, error) {
 func (c *ProdBeaconInstance) GetHeaderForSlot(slot uint64) (*GetHeaderResponse, error) {
 	uri := fmt.Sprintf("%s/eth/v1/beacon/headers/%d", c.beaconURI, slot)
 	resp := new(GetHeaderResponse)
-	_, err := fetchBeacon(http.MethodGet, uri, nil, resp, nil)
+	_, err := fetchBeacon(http.MethodGet, uri, nil, resp, nil, http.Header{})
 	return resp, err
 }
 
@@ -240,7 +253,7 @@ type GetBlockResponse struct {
 func (c *ProdBeaconInstance) GetBlock(blockID string) (block *GetBlockResponse, err error) {
 	uri := fmt.Sprintf("%s/eth/v2/beacon/blocks/%s", c.beaconURI, blockID)
 	resp := new(GetBlockResponse)
-	_, err = fetchBeacon(http.MethodGet, uri, nil, resp, nil)
+	_, err = fetchBeacon(http.MethodGet, uri, nil, resp, nil, http.Header{})
 	return resp, err
 }
 
@@ -248,7 +261,7 @@ func (c *ProdBeaconInstance) GetBlock(blockID string) (block *GetBlockResponse, 
 func (c *ProdBeaconInstance) GetBlockForSlot(slot uint64) (*GetBlockResponse, error) {
 	uri := fmt.Sprintf("%s/eth/v2/beacon/blocks/%d", c.beaconURI, slot)
 	resp := new(GetBlockResponse)
-	_, err := fetchBeacon(http.MethodGet, uri, nil, resp, nil)
+	_, err := fetchBeacon(http.MethodGet, uri, nil, resp, nil, http.Header{})
 	return resp, err
 }
 
@@ -256,9 +269,16 @@ func (c *ProdBeaconInstance) GetURI() string {
 	return c.beaconURI
 }
 
-func (c *ProdBeaconInstance) PublishBlock(block *common.SignedBeaconBlock) (code int, err error) {
-	uri := fmt.Sprintf("%s/eth/v1/beacon/blocks", c.beaconURI)
-	return fetchBeacon(http.MethodPost, uri, block, nil, nil)
+func (c *ProdBeaconInstance) PublishBlock(block *common.SignedBeaconBlock, broadcastMode BroadcastMode) (code int, err error) {
+	var uri string
+	if c.ffUseV2PublishBlockEndpoint {
+		uri = fmt.Sprintf("%s/eth/v2/beacon/blocks?broadcast_validation=%s", c.beaconURI, broadcastMode.String())
+	} else {
+		uri = fmt.Sprintf("%s/eth/v1/beacon/blocks", c.beaconURI)
+	}
+	headers := http.Header{}
+	headers.Add("Eth-Consensus-Version", common.ForkVersionStringCapella) // optional in v1, required in v2
+	return fetchBeacon(http.MethodPost, uri, block, nil, nil, headers)
 }
 
 type GetGenesisResponse struct {
@@ -275,7 +295,7 @@ type GetGenesisResponseData struct {
 func (c *ProdBeaconInstance) GetGenesis() (*GetGenesisResponse, error) {
 	uri := fmt.Sprintf("%s/eth/v1/beacon/genesis", c.beaconURI)
 	resp := new(GetGenesisResponse)
-	_, err := fetchBeacon(http.MethodGet, uri, nil, resp, nil)
+	_, err := fetchBeacon(http.MethodGet, uri, nil, resp, nil, http.Header{})
 	return resp, err
 }
 
@@ -292,7 +312,7 @@ type GetSpecResponse struct {
 func (c *ProdBeaconInstance) GetSpec() (spec *GetSpecResponse, err error) {
 	uri := fmt.Sprintf("%s/eth/v1/config/spec", c.beaconURI)
 	resp := new(GetSpecResponse)
-	_, err = fetchBeacon(http.MethodGet, uri, nil, resp, nil)
+	_, err = fetchBeacon(http.MethodGet, uri, nil, resp, nil, http.Header{})
 	return resp, err
 }
 
@@ -308,7 +328,7 @@ type GetForkScheduleResponse struct {
 func (c *ProdBeaconInstance) GetForkSchedule() (spec *GetForkScheduleResponse, err error) {
 	uri := fmt.Sprintf("%s/eth/v1/config/fork_schedule", c.beaconURI)
 	resp := new(GetForkScheduleResponse)
-	_, err = fetchBeacon(http.MethodGet, uri, nil, resp, nil)
+	_, err = fetchBeacon(http.MethodGet, uri, nil, resp, nil, http.Header{})
 	return resp, err
 }
 
@@ -322,7 +342,7 @@ type GetRandaoResponse struct {
 func (c *ProdBeaconInstance) GetRandao(slot uint64) (randaoResp *GetRandaoResponse, err error) {
 	uri := fmt.Sprintf("%s/eth/v1/beacon/states/%d/randao", c.beaconURI, slot)
 	resp := new(GetRandaoResponse)
-	_, err = fetchBeacon(http.MethodGet, uri, nil, resp, nil)
+	_, err = fetchBeacon(http.MethodGet, uri, nil, resp, nil, http.Header{})
 	return resp, err
 }
 
@@ -336,6 +356,6 @@ type GetWithdrawalsResponse struct {
 func (c *ProdBeaconInstance) GetWithdrawals(slot uint64) (withdrawalsResp *GetWithdrawalsResponse, err error) {
 	uri := fmt.Sprintf("%s/eth/v1/beacon/states/%d/withdrawals", c.beaconURI, slot)
 	resp := new(GetWithdrawalsResponse)
-	_, err = fetchBeacon(http.MethodGet, uri, nil, resp, nil)
+	_, err = fetchBeacon(http.MethodGet, uri, nil, resp, nil, http.Header{})
 	return resp, err
 }
