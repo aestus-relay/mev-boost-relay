@@ -25,6 +25,7 @@ var (
 	redisPrefix = "boost-relay"
 
 	expiryBidCache = 45 * time.Second
+	expiryLock     = 24 * time.Second
 
 	RedisConfigFieldPubkey         = "pubkey"
 	RedisStatsFieldLatestSlot      = "latest-slot"
@@ -93,6 +94,7 @@ type RedisCache struct {
 	prefixFloorBid                    string
 	prefixFloorBidValue               string
 	prefixDeferredDemotions           string
+	prefixProcessingSlot              string
 
 	// keys
 	keyValidatorRegistrationTimestamp string
@@ -103,6 +105,8 @@ type RedisCache struct {
 	keyBlockBuilderStatus string
 	keyLastSlotDelivered  string
 	keyLastHashDelivered  string
+
+	currentSlot uint64
 }
 
 func NewRedisCache(prefix, redisURI, readonlyURI string) (*RedisCache, error) {
@@ -135,6 +139,7 @@ func NewRedisCache(prefix, redisURI, readonlyURI string) (*RedisCache, error) {
 		prefixFloorBid:                    fmt.Sprintf("%s/%s:bid-floor", redisPrefix, prefix),                      // prefix:slot_parentHash_proposerPubkey
 		prefixFloorBidValue:               fmt.Sprintf("%s/%s:bid-floor-value", redisPrefix, prefix),                // prefix:slot_parentHash_proposerPubkey
 		prefixDeferredDemotions:           fmt.Sprintf("%s/%s:deferred-demotions", redisPrefix, prefix),             // prefix:blockHash
+		prefixProcessingSlot:              fmt.Sprintf("%s/%s:processing-slot", redisPrefix, prefix),                // prefix:slot
 
 		keyValidatorRegistrationTimestamp: fmt.Sprintf("%s/%s:validator-registration-timestamp", redisPrefix, prefix),
 		keyRelayConfig:                    fmt.Sprintf("%s/%s:relay-config", redisPrefix, prefix),
@@ -196,6 +201,11 @@ func (r *RedisCache) keyFloorBidValue(slot uint64, parentHash, proposerPubkey st
 // keyDeferredDemotion returns the key for the potential deferred demotion of a given block hash
 func (r *RedisCache) keyDeferredDemotion(blockHash string) string {
 	return fmt.Sprintf("%s:%s", r.prefixDeferredDemotions, blockHash)
+}
+
+// keyProcessingSlot returns the key for the counter of builder processes working on a given slot
+func (r *RedisCache) keyProcessingSlot(slot uint64) string {
+	return fmt.Sprintf("%s:%d", r.prefixProcessingSlot, slot)
 }
 
 func (r *RedisCache) GetObj(key string, obj any) (err error) {
@@ -819,6 +829,51 @@ func (r *RedisCache) GetDeferredDemotion(blockHash string) (*common.DemotionResu
 	resp := new(common.DemotionResult)
 	err := r.GetObj(key, resp)
 	return resp, err
+}
+
+// BeginProcessingSlot signals that a builder process is handling blocks for a given slot
+func (r *RedisCache) BeginProcessingSlot(ctx context.Context, slot uint64) (err error) {
+	// Should never process more than one slot at a time
+	if r.currentSlot != 0 {
+		return fmt.Errorf("already processing slot %d", r.currentSlot)
+	}
+
+	keyProcessingSlot := r.keyProcessingSlot(slot)
+	err = r.client.Incr(ctx, keyProcessingSlot).Err()
+	if err != nil {
+		return err
+	}
+	r.currentSlot = slot
+	err = r.client.Expire(ctx, keyProcessingSlot, expiryLock).Err()
+	return err
+}
+
+// EndProcessingSlot signals that a builder process is done handling blocks for the current slot
+func (r *RedisCache) EndProcessingSlot(ctx context.Context) (err error) {
+	// Do not decrement if called multiple times
+	if r.currentSlot == 0 {
+		return nil
+	}
+
+	keyProcessingSlot := r.keyProcessingSlot(r.currentSlot)
+	err = r.client.Decr(ctx, keyProcessingSlot).Err()
+	r.currentSlot = 0
+	return err
+}
+
+// WaitForSlotComplete waits for a slot to be completed by all builder processes
+func (r *RedisCache) WaitForSlotComplete(ctx context.Context, slot uint64) (err error) {
+	keyProcessingSlot := r.keyProcessingSlot(slot)
+	for {
+		processing, err := r.client.Get(ctx, keyProcessingSlot).Uint64()
+		if err != nil {
+			return err
+		}
+		if processing == 0 {
+			return nil
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
 }
 
 func (r *RedisCache) NewPipeline() redis.Pipeliner { //nolint:ireturn,nolintlint
