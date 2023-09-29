@@ -633,7 +633,7 @@ func (api *RelayAPI) processOptimisticBlock(opts blockSimOptions, simResultC cha
 	defer api.optimisticBlocksWG.Done()
 
 	ctx := context.Background()
-	submission, err := common.GetBlockSubmissionInfo(&opts.req.VersionedSubmitBlockRequest)
+	submission, err := common.GetBlockSubmissionInfo(opts.req.VersionedSubmitBlockRequest)
 	if err != nil {
 		opts.log.WithError(err).Error("error getting block submission info")
 		return
@@ -661,7 +661,7 @@ func (api *RelayAPI) processOptimisticBlock(opts blockSimOptions, simResultC cha
 		}
 
 		// Demote the builder.
-		api.demoteBuilder(builderPubkey, &opts.req.VersionedSubmitBlockRequest, demotionErr)
+		api.demoteBuilder(builderPubkey, opts.req.VersionedSubmitBlockRequest, demotionErr)
 	}
 }
 
@@ -1196,7 +1196,7 @@ func (api *RelayAPI) handleGetHeader(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	if bid.IsEmpty() {
+	if bid == nil || bid.IsEmpty() {
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
@@ -1642,6 +1642,8 @@ func (api *RelayAPI) checkSubmissionPayloadAttrs(w http.ResponseWriter, log *log
 	attrs, ok := api.payloadAttributes[submission.ParentHash.String()]
 	api.payloadAttributesLock.RUnlock()
 	if !ok || submission.Slot != attrs.slot {
+		log.Info(ok)
+		log.Info("payload", submission.Slot, "attrs", attrs.slot)
 		log.Warn("payload attributes not (yet) known")
 		api.RespondError(w, http.StatusBadRequest, "payload attributes not (yet) known")
 		return false
@@ -2094,7 +2096,7 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 		log:        log,
 		builder:    builderEntry,
 		req: &common.BuilderBlockValidationRequest{
-			VersionedSubmitBlockRequest: *payload,
+			VersionedSubmitBlockRequest: payload,
 			RegisteredGasLimit:          gasLimit,
 		},
 	}
