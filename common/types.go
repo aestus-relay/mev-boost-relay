@@ -682,3 +682,44 @@ func (s *SubmitBlockRequestV2Optimistic) SizeSSZ() (size int) {
 
 	return
 }
+
+type DemotionResult struct {
+	Pubkey string                       `json:"pubkey"`
+	Req    *VersionedSubmitBlockRequest `json:"req"`
+	Err    error                        `json:"err"`
+}
+
+func (d *DemotionResult) MarshalJSON() ([]byte, error) {
+	var errorMsg string
+	if d.Err != nil {
+		errorMsg = d.Err.Error()
+	}
+	anon := struct {
+		Pubkey string                       `json:"pubkey"`
+		Req    *VersionedSubmitBlockRequest `json:"req"`
+		Err    string                       `json:"err"`
+	}{
+		Pubkey: d.Pubkey,
+		Req:    d.Req,
+		Err:    errorMsg,
+	}
+	return json.Marshal(anon)
+}
+
+func (d *DemotionResult) UnmarshalJSON(data []byte) error {
+	anon := &struct {
+		Pubkey string                       `json:"pubkey"`
+		Req    *VersionedSubmitBlockRequest `json:"req"`
+		Err    string                       `json:"err"`
+	}{}
+	err := json.Unmarshal(data, anon)
+	if err != nil {
+		return err
+	}
+	d.Pubkey = anon.Pubkey
+	d.Req = anon.Req
+	if anon.Err != "" {
+		d.Err = errors.New(anon.Err)
+	}
+	return nil
+}

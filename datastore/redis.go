@@ -92,6 +92,7 @@ type RedisCache struct {
 	prefixTopBidValue                 string
 	prefixFloorBid                    string
 	prefixFloorBidValue               string
+	prefixDeferredDemotions           string
 
 	// keys
 	keyValidatorRegistrationTimestamp string
@@ -133,6 +134,7 @@ func NewRedisCache(prefix, redisURI, readonlyURI string) (*RedisCache, error) {
 		prefixTopBidValue:                 fmt.Sprintf("%s/%s:top-bid-value", redisPrefix, prefix),                  // prefix:slot_parentHash_proposerPubkey
 		prefixFloorBid:                    fmt.Sprintf("%s/%s:bid-floor", redisPrefix, prefix),                      // prefix:slot_parentHash_proposerPubkey
 		prefixFloorBidValue:               fmt.Sprintf("%s/%s:bid-floor-value", redisPrefix, prefix),                // prefix:slot_parentHash_proposerPubkey
+		prefixDeferredDemotions:           fmt.Sprintf("%s/%s:deferred-demotions", redisPrefix, prefix),             // prefix:blockHash
 
 		keyValidatorRegistrationTimestamp: fmt.Sprintf("%s/%s:validator-registration-timestamp", redisPrefix, prefix),
 		keyRelayConfig:                    fmt.Sprintf("%s/%s:relay-config", redisPrefix, prefix),
@@ -189,6 +191,11 @@ func (r *RedisCache) keyFloorBid(slot uint64, parentHash, proposerPubkey string)
 // keyFloorBidValue returns the key for the highest non-cancellable value of a given slot+parentHash+proposerPubkey
 func (r *RedisCache) keyFloorBidValue(slot uint64, parentHash, proposerPubkey string) string {
 	return fmt.Sprintf("%s:%d_%s_%s", r.prefixFloorBidValue, slot, parentHash, proposerPubkey)
+}
+
+// keyDeferredDemotion returns the key for the potential deferred demotion of a given block hash
+func (r *RedisCache) keyDeferredDemotion(blockHash string) string {
+	return fmt.Sprintf("%s:%s", r.prefixDeferredDemotions, blockHash)
 }
 
 func (r *RedisCache) GetObj(key string, obj any) (err error) {
@@ -799,6 +806,19 @@ func (r *RedisCache) SetFloorBidValue(slot uint64, parentHash, proposerPubkey, v
 	keyFloorBidValue := r.keyFloorBidValue(slot, parentHash, proposerPubkey)
 	err := r.client.Set(context.Background(), keyFloorBidValue, value, 0).Err()
 	return err
+}
+
+func (r *RedisCache) SaveDeferredDemotion(blockHash string, demote *common.DemotionResult) (err error) {
+	key := r.keyDeferredDemotion(blockHash)
+	return r.SetObj(key, demote, expiryBidCache)
+}
+
+// GetDeferredDemotion returns (demote, nil), or (nil, redis.Nil) if there is no deferred demotion
+func (r *RedisCache) GetDeferredDemotion(blockHash string) (*common.DemotionResult, error) {
+	key := r.keyDeferredDemotion(blockHash)
+	resp := new(common.DemotionResult)
+	err := r.GetObj(key, resp)
+	return resp, err
 }
 
 func (r *RedisCache) NewPipeline() redis.Pipeliner { //nolint:ireturn,nolintlint

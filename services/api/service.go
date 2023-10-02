@@ -47,6 +47,9 @@ const (
 	ErrBlockAlreadyKnown  = "simulation failed: block already known"
 	ErrBlockRequiresReorg = "simulation failed: block requires a reorg"
 	ErrMissingTrieNode    = "missing trie node"
+	ErrUnknownAncestor    = "unknown ancestor"
+	ErrProxyingRequest    = "proxying request failed"
+	ErrQueueTimeout       = "(Client.Timeout exceeded while awaiting headers)"
 )
 
 var (
@@ -626,7 +629,9 @@ func (api *RelayAPI) demoteBuilder(pubkey string, req *common.VersionedSubmitBlo
 // needs to be simulated.
 func (api *RelayAPI) processOptimisticBlock(opts blockSimOptions, simResultC chan *blockSimResult) {
 	api.optimisticBlocksInFlight.Add(1)
-	defer func() { api.optimisticBlocksInFlight.Sub(1) }()
+	defer func() {
+		api.optimisticBlocksInFlight.Sub(1)
+	}()
 	api.optimisticBlocksWG.Add(1)
 	defer api.optimisticBlocksWG.Done()
 
@@ -647,16 +652,34 @@ func (api *RelayAPI) processOptimisticBlock(opts blockSimOptions, simResultC cha
 	reqErr, simErr := api.simulateBlock(ctx, opts)
 	simResultC <- &blockSimResult{reqErr == nil, true, reqErr, simErr}
 	if reqErr != nil || simErr != nil {
-		// Mark builder as non-optimistic.
-		opts.builder.status.IsOptimistic = false
-		api.log.WithError(simErr).Warn("block simulation failed in processOptimisticBlock, demoting builder")
-
 		var demotionErr error
 		if reqErr != nil {
 			demotionErr = reqErr
 		} else {
 			demotionErr = simErr
 		}
+
+		// Check for errors for which we will not demote unless the block wins the slot
+		ignoreError := strings.Contains(demotionErr.Error(), ErrUnknownAncestor) || strings.Contains(demotionErr.Error(), ErrProxyingRequest) || strings.Contains(demotionErr.Error(), ErrQueueTimeout)
+		if ignoreError {
+			opts.log.WithError(demotionErr).Warn("Ignorable validation error, deferring demotion check")
+			blockHash := submission.BidTrace.BlockHash.String()
+			demote := &common.DemotionResult{
+				Pubkey: builderPubkey,
+				Req:    opts.req.VersionedSubmitBlockRequest,
+				Err:    demotionErr,
+			}
+
+			err := api.redis.SaveDeferredDemotion(blockHash, demote)
+			if err != nil {
+				api.log.WithError(err).Error("could not save deferred demotion")
+			}
+			return
+		}
+
+		// Mark builder as non-optimistic.
+		opts.builder.status.IsOptimistic = false
+		api.log.WithError(demotionErr).Warn("block simulation failed in processOptimisticBlock, demoting builder")
 
 		// Demote the builder.
 		api.demoteBuilder(builderPubkey, opts.req.VersionedSubmitBlockRequest, demotionErr)
@@ -1385,6 +1408,20 @@ func (api *RelayAPI) handleGetPayload(w http.ResponseWriter, req *http.Request) 
 
 		// Wait until optimistic blocks are complete.
 		api.optimisticBlocksWG.Wait()
+
+		// Check if this block had a deferred demotion
+		demote, err := api.redis.GetDeferredDemotion(blockHash.String())
+		if err == nil {
+			// We cannot safely leave the builder promoted; this block may have been invalid
+			// Demote builder, triggering all following steps
+			log.WithFields(logrus.Fields{
+				"reqBuilderPubkey": demote.Pubkey,
+				"reqSlot":          uint64(slot),
+				"reqBlockHash":     blockHash.String(),
+				"err":              demote.Err,
+			}).Error("demoting builder after winning slot by block with deferred demotion")
+			api.demoteBuilder(demote.Pubkey, demote.Req, demote.Err)
+		}
 
 		// Check if there is a demotion for the winning block.
 		_, err = api.db.GetBuilderDemotion(bidTrace)
