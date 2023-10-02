@@ -89,6 +89,7 @@ type RedisCache struct {
 	prefixFloorBid                    string
 	prefixFloorBidValue               string
 	prefixProcessingSlot              string
+	prefixDeferredDemotions           string
 
 	// keys
 	keyValidatorRegistrationTimestamp string
@@ -125,6 +126,7 @@ func NewRedisCache(prefix string, redisURIs []string, redisPassword string) (*Re
 		prefixFloorBid:                    fmt.Sprintf("%s/%s:bid-floor", redisPrefix, prefix),                      // prefix:slot_parentHash_proposerPubkey
 		prefixFloorBidValue:               fmt.Sprintf("%s/%s:bid-floor-value", redisPrefix, prefix),                // prefix:slot_parentHash_proposerPubkey
 		prefixProcessingSlot:              fmt.Sprintf("%s/%s:processing-slot", redisPrefix, prefix),                // prefix:slot
+		prefixDeferredDemotions:           fmt.Sprintf("%s/%s:deferred-demotions", redisPrefix, prefix),             // prefix:blockHash
 
 		keyValidatorRegistrationTimestamp: fmt.Sprintf("%s/%s:validator-registration-timestamp", redisPrefix, prefix),
 		keyRelayConfig:                    fmt.Sprintf("%s/%s:relay-config", redisPrefix, prefix),
@@ -187,6 +189,11 @@ func (r *RedisCache) keyFloorBidValue(slot uint64, parentHash, proposerPubkey st
 // keyProcessingSlot returns the key for the counter of builder processes working on a given slot
 func (r *RedisCache) keyProcessingSlot(slot uint64) string {
 	return fmt.Sprintf("%s:%d", r.prefixProcessingSlot, slot)
+}
+
+// keyDeferredDemotion returns the key for the potential deferred demotion of a given block hash
+func (r *RedisCache) keyDeferredDemotion(blockHash string) string {
+	return fmt.Sprintf("%s:%s", r.prefixDeferredDemotions, blockHash)
 }
 
 func (r *RedisCache) GetObj(key string, obj any) (err error) {
@@ -829,6 +836,19 @@ func (r *RedisCache) WaitForSlotComplete(ctx context.Context, slot uint64) (err 
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
+}
+
+func (r *RedisCache) SaveDeferredDemotion(blockHash string, demote *common.DemotionResult) (err error) {
+	key := r.keyDeferredDemotion(blockHash)
+	return r.SetObj(key, demote, expiryBidCache)
+}
+
+// GetDemotionResult returns (demote, nil), or (nil, redis.Nil) if there is no deferred demotion
+func (r *RedisCache) GetDeferredDemotion(blockHash string) (*common.DemotionResult, error) {
+	key := r.keyDeferredDemotion(blockHash)
+	resp := new(common.DemotionResult)
+	err := r.GetObj(key, resp)
+	return resp, err
 }
 
 func (r *RedisCache) NewPipeline() redis.Pipeliner { //nolint:ireturn,nolintlint
