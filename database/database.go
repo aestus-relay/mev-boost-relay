@@ -126,16 +126,15 @@ func (s *DatabaseService) NumValidatorRegistrationRows() (count uint64, err erro
 }
 
 func (s *DatabaseService) SaveValidatorRegistration(entry ValidatorRegistrationEntry) error {
-	query := `WITH latest_registration AS (
-		SELECT DISTINCT ON (pubkey) pubkey, fee_recipient, timestamp, gas_limit, signature FROM ` + vars.TableValidatorRegistration + ` WHERE pubkey=:pubkey ORDER BY pubkey, timestamp DESC limit 1
-	)
-	INSERT INTO ` + vars.TableValidatorRegistration + ` (pubkey, fee_recipient, timestamp, gas_limit, signature)
-	SELECT :pubkey, :fee_recipient, :timestamp, :gas_limit, :signature
-	WHERE NOT EXISTS (
-		SELECT 1 from latest_registration WHERE pubkey=:pubkey AND :timestamp <= latest_registration.timestamp OR (:fee_recipient = latest_registration.fee_recipient AND :gas_limit = latest_registration.gas_limit)
-	);`
-	_, err := s.DB.NamedExec(query, entry)
-	return err
+	query := `INSERT INTO ` + vars.TableValidatorRegistration + ` (pubkey, fee_recipient, timestamp, gas_limit, signature)
+                VALUES (:pubkey, :fee_recipient, :timestamp, :gas_limit, :signature)
+                ON CONFLICT (pubkey, fee_recipient, gas_limit)
+                DO UPDATE SET
+                    timestamp = EXCLUDED.timestamp,
+                    signature = EXCLUDED.signature
+                WHERE EXCLUDED.timestamp > ` + vars.TableValidatorRegistration + `.timestamp;`
+    _, err := s.DB.NamedExec(query, entry)
+    return err
 }
 
 func (s *DatabaseService) GetValidatorRegistration(pubkey string) (*ValidatorRegistrationEntry, error) {
