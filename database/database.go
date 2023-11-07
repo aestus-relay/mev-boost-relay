@@ -133,8 +133,8 @@ func (s *DatabaseService) SaveValidatorRegistration(entry ValidatorRegistrationE
                     timestamp = EXCLUDED.timestamp,
                     signature = EXCLUDED.signature
                 WHERE EXCLUDED.timestamp > ` + vars.TableValidatorRegistration + `.timestamp;`
-    _, err := s.DB.NamedExec(query, entry)
-    return err
+	_, err := s.DB.NamedExec(query, entry)
+	return err
 }
 
 func (s *DatabaseService) GetValidatorRegistration(pubkey string) (*ValidatorRegistrationEntry, error) {

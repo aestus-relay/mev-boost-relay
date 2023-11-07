@@ -15,6 +15,7 @@ import (
 	"github.com/flashbots/go-utils/cli"
 	"github.com/flashbots/go-utils/jsonrpc"
 	"github.com/flashbots/mev-boost-relay/common"
+	"go.opentelemetry.io/otel"
 )
 
 var (
@@ -51,6 +52,9 @@ func NewBlockSimulationRateLimiter(blockSimURL string) *BlockSimulationRateLimit
 }
 
 func (b *BlockSimulationRateLimiter) Send(context context.Context, payload *common.BuilderBlockValidationRequest, isHighPrio, fastTrack bool) (requestErr, validationErr error) {
+	context, span := otel.Tracer("api").Start(context, "BlockSimulationRateLimiter.Send")
+	defer span.End()
+
 	b.cv.L.Lock()
 	cnt := atomic.AddInt64(&b.counter, 1)
 	if maxConcurrentBlocks > 0 && cnt > maxConcurrentBlocks {

@@ -5,6 +5,7 @@ import (
 	"math/big"
 
 	"github.com/go-redis/redis/v9"
+	"go.opentelemetry.io/otel"
 )
 
 // BuilderBids supports redis.SaveBidAndUpdateTopBid
@@ -13,6 +14,9 @@ type BuilderBids struct {
 }
 
 func NewBuilderBidsFromRedis(ctx context.Context, r *RedisCache, pipeliner redis.Pipeliner, slot uint64, parentHash, proposerPubkey string) (*BuilderBids, error) {
+	ctx, span := otel.Tracer("datastore").Start(ctx, "NewBuilderBidsFromRedis")
+	defer span.End()
+
 	keyBidValues := r.keyBlockBuilderLatestBidsValue(slot, parentHash, proposerPubkey)
 	bidValueMap, err := r.HGetAllPL(ctx, pipeliner, keyBidValues)
 	if err != nil {

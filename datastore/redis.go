@@ -17,10 +17,12 @@ import (
 	"github.com/flashbots/go-utils/cli"
 	"github.com/flashbots/mev-boost-relay/common"
 	"github.com/go-redis/redis/v9"
+	"github.com/hedhyw/otelinji/pkg/otelinji"
+	"go.opentelemetry.io/otel"
 )
 
 var (
-	redisPrefix = "boost-relay"
+	redisPrefix  = "boost-relay"
 	redisBidHash = "bid-stats"
 
 	expiryBidCache = 45 * time.Second
@@ -114,7 +116,7 @@ func NewRedisCache(prefix string, redisURIs []string, redisPassword string) (*Re
 	}
 
 	return &RedisCache{
-		client:         client,
+		client: client,
 
 		prefixGetHeaderResponse:  fmt.Sprintf("%s/%s:cache-gethead-response", redisPrefix, prefix),
 		prefixExecPayloadCapella: fmt.Sprintf("%s/%s:cache-execpayload-capella", redisPrefix, prefix),
@@ -214,6 +216,9 @@ func (r *RedisCache) SetObj(key string, value any, expiration time.Duration) (er
 // SetObjPipelined saves an object in the given Redis key on a Redis pipeline (JSON encoded)
 
 func (r *RedisCache) SetObjPipelined(ctx context.Context, pipeliner redis.Pipeliner, key string, value any, expiration time.Duration) (err error) {
+	ctx, span := otel.Tracer("datastore").Start(ctx, "RedisCache.SetObjPipelined")
+	defer func() { otelinji.EndSpanWithErr(span, err) }()
+
 	if pipeliner == nil {
 		return r.SetObj(key, value, expiration)
 	}
@@ -303,6 +308,9 @@ func (r *RedisCache) CheckAndSetLastSlotAndHashDelivered(slot uint64, hash strin
 }
 
 func (r *RedisCache) GetLastSlotDelivered(ctx context.Context, pipeliner redis.Pipeliner) (slot uint64, err error) {
+	ctx, span := otel.Tracer("datastore").Start(ctx, "RedisCache.GetLastSlotDelivered")
+	defer func() { otelinji.EndSpanWithErr(span, err) }()
+
 	c, err := r.GetPL(ctx, pipeliner, r.keyLastSlotDelivered)
 	if err != nil {
 		return 0, err
@@ -369,6 +377,9 @@ func (r *RedisCache) GetBestBid(slot uint64, parentHash, proposerPubkey string) 
 }
 
 func (r *RedisCache) SaveExecutionPayloadCapella(ctx context.Context, pipeliner redis.Pipeliner, slot uint64, proposerPubkey, blockHash string, execPayload *capella.ExecutionPayload) (err error) {
+	ctx, span := otel.Tracer("datastore").Start(ctx, "RedisCache.SaveExecutionPayloadCapella")
+	defer func() { otelinji.EndSpanWithErr(span, err) }()
+
 	key := r.keyExecPayloadCapella(slot, proposerPubkey, blockHash)
 	b, err := execPayload.MarshalSSZ()
 	if err != nil {
@@ -399,6 +410,9 @@ func (r *RedisCache) GetExecutionPayloadCapella(slot uint64, proposerPubkey, blo
 }
 
 func (r *RedisCache) SaveBidTrace(ctx context.Context, pipeliner redis.Pipeliner, trace *common.BidTraceV2) (err error) {
+	ctx, span := otel.Tracer("datastore").Start(ctx, "RedisCache.SaveBidTrace")
+	defer func() { otelinji.EndSpanWithErr(span, err) }()
+
 	key := r.keyCacheBidTrace(trace.Slot, trace.ProposerPubkey.String(), trace.BlockHash.String())
 	return r.SetObjPipelined(ctx, pipeliner, key, trace, expiryBidCache)
 }
@@ -412,6 +426,11 @@ func (r *RedisCache) GetBidTrace(slot uint64, proposerPubkey, blockHash string) 
 }
 
 func (r *RedisCache) GetBuilderLatestPayloadReceivedAt(ctx context.Context, pipeliner redis.Pipeliner, slot uint64, builderPubkey, parentHash, proposerPubkey string) (int64, error) {
+	ctx, span := otel.Tracer("datastore").Start(ctx, "RedisCache.GetBuilderLatestPayloadReceivedAt")
+	defer span.End()
+
+	_ = ctx
+
 	keyLatestBidsTime := r.keyBlockBuilderLatestBidsTime(slot, parentHash, proposerPubkey)
 	c, err := r.HGetPL(context.Background(), pipeliner, keyLatestBidsTime, builderPubkey)
 	if errors.Is(err, redis.Nil) {
@@ -424,6 +443,9 @@ func (r *RedisCache) GetBuilderLatestPayloadReceivedAt(ctx context.Context, pipe
 
 // SaveBuilderBid saves the latest bid by a specific builder. TODO: use transaction to make these writes atomic
 func (r *RedisCache) SaveBuilderBid(ctx context.Context, pipeliner redis.Pipeliner, slot uint64, parentHash, proposerPubkey, builderPubkey string, receivedAt time.Time, headerResp *common.GetHeaderResponse) (err error) {
+	ctx, span := otel.Tracer("datastore").Start(ctx, "RedisCache.SaveBuilderBid")
+	defer func() { otelinji.EndSpanWithErr(span, err) }()
+
 	// save the actual bid
 	keyLatestBid := r.keyLatestBidByBuilder(slot, parentHash, proposerPubkey, builderPubkey)
 	err = r.SetObjPipelined(ctx, pipeliner, keyLatestBid, headerResp, expiryBidCache)
@@ -468,6 +490,9 @@ type SaveBidAndUpdateTopBidResponse struct {
 }
 
 func (r *RedisCache) SaveBidAndUpdateTopBid(ctx context.Context, pipeliner redis.Pipeliner, trace *common.BidTraceV2, payload *common.BuilderSubmitBlockRequest, getPayloadResponse *common.GetPayloadResponse, getHeaderResponse *common.GetHeaderResponse, reqReceivedAt time.Time, isCancellationEnabled bool, floorValue *big.Int) (state SaveBidAndUpdateTopBidResponse, err error) {
+	ctx, span := otel.Tracer("datastore").Start(ctx, "RedisCache.SaveBidAndUpdateTopBid")
+	defer func() { otelinji.EndSpanWithErr(span, err) }()
+
 	var prevTime, nextTime time.Time
 	prevTime = time.Now()
 
@@ -649,6 +674,9 @@ func (r *RedisCache) _updateTopBid(ctx context.Context, pipeliner redis.Pipeline
 
 // GetTopBidValue gets the top bid value for a given slot+parent+proposer combination
 func (r *RedisCache) GetTopBidValue(ctx context.Context, pipeliner redis.Pipeliner, slot uint64, parentHash, proposerPubkey string) (topBidValue *big.Int, err error) {
+	ctx, span := otel.Tracer("datastore").Start(ctx, "RedisCache.GetTopBidValue")
+	defer func() { otelinji.EndSpanWithErr(span, err) }()
+
 	keyTopBidValue := r.keyTopBidValue(slot, parentHash, proposerPubkey)
 	c, err := r.GetPL(ctx, pipeliner, keyTopBidValue)
 	if errors.Is(err, redis.Nil) {
@@ -682,6 +710,9 @@ func (r *RedisCache) GetBuilderLatestValue(slot uint64, parentHash, proposerPubk
 
 // DelBuilderBid removes a builders most recent bid
 func (r *RedisCache) DelBuilderBid(ctx context.Context, pipeliner redis.Pipeliner, slot uint64, parentHash, proposerPubkey, builderPubkey string) (err error) {
+	ctx, span := otel.Tracer("datastore").Start(ctx, "RedisCache.DelBuilderBid")
+	defer func() { otelinji.EndSpanWithErr(span, err) }()
+
 	// delete the value
 	keyLatestValue := r.keyBlockBuilderLatestBidsValue(slot, parentHash, proposerPubkey)
 	err = r.client.HDel(ctx, keyLatestValue, builderPubkey).Err()
@@ -704,6 +735,9 @@ func (r *RedisCache) DelBuilderBid(ctx context.Context, pipeliner redis.Pipeline
 
 // GetFloorBidValue returns the value of the highest non-cancellable bid
 func (r *RedisCache) GetFloorBidValue(ctx context.Context, pipeliner redis.Pipeliner, slot uint64, parentHash, proposerPubkey string) (floorValue *big.Int, err error) {
+	ctx, span := otel.Tracer("datastore").Start(ctx, "RedisCache.GetFloorBidValue")
+	defer func() { otelinji.EndSpanWithErr(span, err) }()
+
 	keyFloorBidValue := r.keyFloorBidValue(slot, parentHash, proposerPubkey)
 	c, err := r.GetPL(ctx, pipeliner, keyFloorBidValue)
 	if errors.Is(err, redis.Nil) {
@@ -730,6 +764,9 @@ func (r *RedisCache) SetFloorBidValue(slot uint64, parentHash, proposerPubkey, v
 
 // BeginProcessingSlot signals that a builder process is handling blocks for a given slot
 func (r *RedisCache) BeginProcessingSlot(ctx context.Context, slot uint64) (err error) {
+	ctx, span := otel.Tracer("datastore").Start(ctx, "RedisCache.BeginProcessingSlot")
+	defer func() { otelinji.EndSpanWithErr(span, err) }()
+
 	// Should never process more than one slot at a time
 	if r.currentSlot != 0 {
 		return fmt.Errorf("already processing slot %d", r.currentSlot) //nolint:goerr113
@@ -747,6 +784,9 @@ func (r *RedisCache) BeginProcessingSlot(ctx context.Context, slot uint64) (err 
 
 // EndProcessingSlot signals that a builder process is done handling blocks for the current slot
 func (r *RedisCache) EndProcessingSlot(ctx context.Context) (err error) {
+	ctx, span := otel.Tracer("datastore").Start(ctx, "RedisCache.EndProcessingSlot")
+	defer func() { otelinji.EndSpanWithErr(span, err) }()
+
 	// Do not decrement if called multiple times
 	if r.currentSlot == 0 {
 		return nil
@@ -760,6 +800,9 @@ func (r *RedisCache) EndProcessingSlot(ctx context.Context) (err error) {
 
 // WaitForSlotComplete waits for a slot to be completed by all builder processes
 func (r *RedisCache) WaitForSlotComplete(ctx context.Context, slot uint64) (err error) {
+	ctx, span := otel.Tracer("datastore").Start(ctx, "RedisCache.WaitForSlotComplete")
+	defer func() { otelinji.EndSpanWithErr(span, err) }()
+
 	keyProcessingSlot := r.keyProcessingSlot(slot)
 	for {
 		processing, err := r.client.Get(ctx, keyProcessingSlot).Uint64()
@@ -795,6 +838,9 @@ func (r *RedisCache) NewTxPipeline() redis.Pipeliner { //nolint:ireturn
 }
 
 func (r *RedisCache) GetPL(ctx context.Context, pipeliner redis.Pipeliner, key string) (*redis.StringCmd, error) {
+	ctx, span := otel.Tracer("datastore").Start(ctx, "RedisCache.GetPL")
+	defer span.End()
+
 	if pipeliner == nil {
 		c := r.client.Get(ctx, key)
 		return c, c.Err()
@@ -808,6 +854,9 @@ func (r *RedisCache) GetPL(ctx context.Context, pipeliner redis.Pipeliner, key s
 }
 
 func (r *RedisCache) SetPL(ctx context.Context, pipeliner redis.Pipeliner, key string, value interface{}, expiration time.Duration) error {
+	ctx, span := otel.Tracer("datastore").Start(ctx, "RedisCache.SetPL")
+	defer span.End()
+
 	if pipeliner == nil {
 		return r.client.Set(ctx, key, value, expiration).Err()
 	}
@@ -815,6 +864,9 @@ func (r *RedisCache) SetPL(ctx context.Context, pipeliner redis.Pipeliner, key s
 }
 
 func (r *RedisCache) HGetPL(ctx context.Context, pipeliner redis.Pipeliner, key, field string) (*redis.StringCmd, error) {
+	ctx, span := otel.Tracer("datastore").Start(ctx, "RedisCache.HGetPL")
+	defer span.End()
+
 	if pipeliner == nil {
 		c := r.client.HGet(ctx, key, field)
 		return c, c.Err()
@@ -829,6 +881,9 @@ func (r *RedisCache) HGetPL(ctx context.Context, pipeliner redis.Pipeliner, key,
 }
 
 func (r *RedisCache) HGetAllPL(ctx context.Context, pipeliner redis.Pipeliner, key string) (map[string]string, error) {
+	ctx, span := otel.Tracer("datastore").Start(ctx, "RedisCache.HGetAllPL")
+	defer span.End()
+
 	if pipeliner == nil {
 		return r.client.HGetAll(ctx, key).Result()
 	}
@@ -846,6 +901,9 @@ func (r *RedisCache) HGetAllPL(ctx context.Context, pipeliner redis.Pipeliner, k
 }
 
 func (r *RedisCache) HSetPL(ctx context.Context, pipeliner redis.Pipeliner, key, field string, value interface{}) error {
+	ctx, span := otel.Tracer("datastore").Start(ctx, "RedisCache.HSetPL")
+	defer span.End()
+
 	if pipeliner == nil {
 		return r.client.HSet(ctx, key, field, value).Err()
 	}
@@ -853,6 +911,9 @@ func (r *RedisCache) HSetPL(ctx context.Context, pipeliner redis.Pipeliner, key,
 }
 
 func (r *RedisCache) ExpirePL(ctx context.Context, pipeliner redis.Pipeliner, key string, expiration time.Duration) error {
+	ctx, span := otel.Tracer("datastore").Start(ctx, "RedisCache.ExpirePL")
+	defer span.End()
+
 	if pipeliner == nil {
 		return r.client.Expire(ctx, key, expiration).Err()
 	}
@@ -860,6 +921,9 @@ func (r *RedisCache) ExpirePL(ctx context.Context, pipeliner redis.Pipeliner, ke
 }
 
 func (r *RedisCache) CopyPL(ctx context.Context, pipeliner redis.Pipeliner, src, dest string, db int, replace bool, obj any) error {
+	ctx, span := otel.Tracer("datastore").Start(ctx, "RedisCache.CopyPL")
+	defer span.End()
+
 	if pipeliner == nil {
 		// Have to break this up into a get and set to prevent crossslot errors
 		err := r.GetObj(src, obj)
@@ -885,6 +949,9 @@ func (r *RedisCache) CopyPL(ctx context.Context, pipeliner redis.Pipeliner, src,
 }
 
 func (r *RedisCache) ExecPL(ctx context.Context, pipeliner redis.Pipeliner) error {
+	ctx, span := otel.Tracer("datastore").Start(ctx, "RedisCache.ExecPL")
+	defer span.End()
+
 	if pipeliner == nil {
 		return nil
 	}
