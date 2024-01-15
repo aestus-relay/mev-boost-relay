@@ -8,7 +8,7 @@ MEV-Boost Relay for Ethereum proposer/builder separation (PBS).
 
 Currently live at:
 
-* [boost-relay.flashbots.net](https://boost-relay.flashbots.net) (also on [Goerli](https://boost-relay-goerli.flashbots.net) and [Sepolia](https://boost-relay-sepolia.flashbots.net))
+* [boost-relay.flashbots.net](https://boost-relay.flashbots.net) (also on [Goerli](https://boost-relay-goerli.flashbots.net),  [Sepolia](https://boost-relay-sepolia.flashbots.net) and [Holesky](https://boost-relay-holesky.flashbots.net))
 * [relay.ultrasound.money](https://relay.ultrasound.money), [agnostic-relay.net](https://agnostic-relay.net), bloXroute relays ([light fork](https://github.com/bloXroute-Labs/mev-relay))
 * [mainnet.aestus.live](https://mainnet.aestus.live), [relay.edennetwork.io/info](https://relay.edennetwork.io/info), [mainnet-relay.securerpc.com](https://mainnet-relay.securerpc.com)
 
@@ -160,9 +160,18 @@ redis-cli DEL boost-relay/sepolia:validators-registration boost-relay/sepolia:va
 * `RUN_INTEGRATION_TESTS` - when set to "1" enables integration tests, currently used for testing Memcached using comma separated list of endpoints specified by `MEMCACHED_URIS`
 * `TEST_DB_DSN` - specifies connection string using Data Source Name (DSN) for Postgres (default: postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable)
 
-#### Redis tuning
+#### Redis Tuning
 
 * `REDIS_CONNECTION_POOL_SIZE`, `REDIS_MIN_IDLE_CONNECTIONS`, `REDIS_READ_TIMEOUT_SEC`, `REDIS_POOL_TIMEOUT_SEC`, `REDIS_WRITE_TIMEOUT_SEC` (see also [the code here](https://github.com/flashbots/mev-boost-relay/blob/e39cd38010de26bf9a51d1a3e77fc235ea87b12f/datastore/redis.go#L35-L41))
+
+#### Website
+
+* `LINK_BEACONCHAIN` - url for beaconcha.in (default: `https://beaconcha.in`)
+* `LINK_DATA_API` - origin url for data api (https://domain:port)
+* `LINK_ETHERSCAN` - url for etherscan (default: `https://etherscan.io`)
+* `LISTEN_ADDR` - listen address for webserver (default: `localhost:9060`)
+* `RELAY_URL` - full url for the relay (https://pubkey@host)
+* `SHOW_CONFIG_DETAILS` - when set to "1", logs configuration details
 
 ## Updating the website
 
