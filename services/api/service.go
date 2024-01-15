@@ -1637,9 +1637,11 @@ func (api *RelayAPI) checkSubmissionPayloadAttrs(w http.ResponseWriter, log *log
 	attrs, ok := api.payloadAttributes[submission.ParentHash.String()]
 	api.payloadAttributesLock.RUnlock()
 	if !ok || submission.Slot != attrs.slot {
-		log.Info(ok)
-		log.Info("payload", submission.Slot, "attrs", attrs.slot)
-		log.Warn("payload attributes not (yet) known")
+		log.WithFields(logrus.Fields{
+			"ok":          ok,
+			"submissionslot":        submission.Slot,
+			"attrs.slot":  attrs.slot,
+		}).Warn("payload attributes not (yet) known")
 		api.RespondError(w, http.StatusBadRequest, "payload attributes not (yet) known")
 		return attrs, false
 	}
