@@ -43,10 +43,6 @@ var (
 	redisWriteTimeoutSec    = cli.GetEnvInt("REDIS_WRITE_TIMEOUT_SEC", 0)    // 0 means use default (3 seconds)
 )
 
-func PubkeyHexToLowerStr(pk boostTypes.PubkeyHex) string {
-	return strings.ToLower(string(pk))
-}
-
 func connectRedis(redisURIs []string, redisPassword string) (*redis.ClusterClient, error) {
 	clusterOpt := &redis.ClusterOptions{
 		Addrs:    redisURIs,
@@ -481,7 +477,7 @@ func (r *RedisCache) SaveBuilderBid(ctx context.Context, pipeliner redis.Pipelin
 
 	// set the value last, because that's iterated over when updating the best bid, and the payload has to be available
 	keyLatestBidsValue := r.keyBlockBuilderLatestBidsValue(slot, parentHash, proposerPubkey)
-	err = r.HSetPL(ctx, pipeliner, keyLatestBidsValue, builderPubkey, headerResp.Value().String())
+	err = r.HSetPL(ctx, pipeliner, keyLatestBidsValue, builderPubkey, headerResp)
 	if err != nil {
 		return err
 	}
@@ -616,9 +612,9 @@ func (r *RedisCache) SaveBidAndUpdateTopBid(ctx context.Context, pipeliner redis
 	}
 
 	// Non-cancellable bid above floor should set new floor
-	keyBidSource := r.keyLatestBidByBuilder(payload.Slot(), payload.ParentHash(), payload.ProposerPubkey(), payload.BuilderPubkey().String())
-	keyFloorBid := r.keyFloorBid(payload.Slot(), payload.ParentHash(), payload.ProposerPubkey())
-	resp := new(common.GetHeaderResponse)
+	keyBidSource := r.keyLatestBidByBuilder(submission.Slot, submission.ParentHash.String(), submission.Proposer.String(), submission.Builder.String())
+	keyFloorBid := r.keyFloorBid(submission.Slot, submission.ParentHash.String(), submission.Proposer.String())
+	resp := new(builderSpec.VersionedSignedBuilderBid)
 	err = r.CopyPL(ctx, pipeliner, keyBidSource, keyFloorBid, 0, true, resp)
 	if err != nil {
 		return state, err
@@ -628,8 +624,8 @@ func (r *RedisCache) SaveBidAndUpdateTopBid(ctx context.Context, pipeliner redis
 		return state, err
 	}
 
-	keyFloorBidValue := r.keyFloorBidValue(payload.Slot(), payload.ParentHash(), payload.ProposerPubkey())
-	err = r.SetPL(ctx, pipeliner, keyFloorBidValue, payload.Value().String(), expiryBidCache)
+	keyFloorBidValue := r.keyFloorBidValue(submission.Slot, submission.ParentHash.String(), submission.Proposer.String())
+	err = r.SetPL(ctx, pipeliner, keyFloorBidValue, submission.Value.Dec(), expiryBidCache)
 	if err != nil {
 		return state, err
 	}
@@ -676,7 +672,7 @@ func (r *RedisCache) _updateTopBid(ctx context.Context, pipeliner redis.Pipeline
 
 	// Copy winning bid to top bid cache
 	keyTopBid := r.keyCacheGetHeaderResponse(slot, parentHash, proposerPubkey)
-	intermediate := new(common.GetHeaderResponse)
+	intermediate := new(builderSpec.VersionedSignedBuilderBid)
 	err = r.CopyPL(context.Background(), pipeliner, keyBidSource, keyTopBid, 0, true, intermediate)
 	if err != nil {
 		return state, err
