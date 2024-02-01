@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/flashbots/go-boost-utils/types"
+	builderApiV1 "github.com/attestantio/go-builder-client/api/v1"
 	"github.com/flashbots/mev-boost-relay/common"
 	"github.com/flashbots/mev-boost-relay/database/migrations"
 	"github.com/flashbots/mev-boost-relay/database/vars"
@@ -25,7 +25,7 @@ type IDatabaseService interface {
 	GetValidatorRegistration(pubkey string) (*ValidatorRegistrationEntry, error)
 	GetValidatorRegistrationsForPubkeys(pubkeys []string) ([]*ValidatorRegistrationEntry, error)
 
-	SaveBuilderBlockSubmission(payload *common.BuilderSubmitBlockRequest, requestError, validationError error, receivedAt, eligibleAt time.Time, wasSimulated, saveExecPayload bool, profile common.Profile, optimisticSubmission bool) (entry *BuilderBlockSubmissionEntry, err error)
+	SaveBuilderBlockSubmission(payload *common.VersionedSubmitBlockRequest, requestError, validationError error, receivedAt, eligibleAt time.Time, wasSimulated, saveExecPayload bool, profile common.Profile, optimisticSubmission bool) (entry *BuilderBlockSubmissionEntry, err error)
 	GetBlockSubmissionEntry(slot uint64, proposerPubkey, blockHash string) (entry *BuilderBlockSubmissionEntry, err error)
 	GetBuilderSubmissions(filters GetBuilderSubmissionsFilters) ([]*BuilderBlockSubmissionEntry, error)
 	GetBuilderSubmissionsBySlots(slotFrom, slotTo uint64) (entries []*BuilderBlockSubmissionEntry, err error)
@@ -34,7 +34,7 @@ type IDatabaseService interface {
 	GetExecutionPayloads(idFirst, idLast uint64) (entries []*ExecutionPayloadEntry, err error)
 	DeleteExecutionPayloads(idFirst, idLast uint64) error
 
-	SaveDeliveredPayload(bidTrace *common.BidTraceV2, signedBlindedBeaconBlock *common.SignedBlindedBeaconBlock, signedAt time.Time, publishMs uint64) error
+	SaveDeliveredPayload(bidTrace *common.BidTraceV2WithBlobFields, signedBlindedBeaconBlock *common.VersionedSignedBlindedBeaconBlock, signedAt time.Time, publishMs uint64) error
 	GetNumDeliveredPayloads() (uint64, error)
 	GetRecentDeliveredPayloads(filters GetPayloadsFilters) ([]*DeliveredPayloadEntry, error)
 	GetDeliveredPayloads(idFirst, idLast uint64) (entries []*DeliveredPayloadEntry, err error)
@@ -47,9 +47,9 @@ type IDatabaseService interface {
 	UpsertBlockBuilderEntryAfterSubmission(lastSubmission *BuilderBlockSubmissionEntry, isError bool) error
 	IncBlockBuilderStatsAfterGetPayload(builderPubkey string) error
 
-	InsertBuilderDemotion(submitBlockRequest *common.BuilderSubmitBlockRequest, simError error) error
-	UpdateBuilderDemotion(trace *common.BidTraceV2, signedBlock *common.SignedBeaconBlock, signedRegistration *types.SignedValidatorRegistration) error
-	GetBuilderDemotion(trace *common.BidTraceV2) (*BuilderDemotionEntry, error)
+	InsertBuilderDemotion(submitBlockRequest *common.VersionedSubmitBlockRequest, simError error) error
+	UpdateBuilderDemotion(trace *common.BidTraceV2WithBlobFields, signedBlock *common.VersionedSignedProposal, signedRegistration *builderApiV1.SignedValidatorRegistration) error
+	GetBuilderDemotion(trace *common.BidTraceV2WithBlobFields) (*BuilderDemotionEntry, error)
 
 	GetTooLateGetPayload(slot uint64) (entries []*TooLateGetPayloadEntry, err error)
 	InsertTooLateGetPayload(slot uint64, proposerPubkey, blockHash string, slotStart, requestTime, decodeTime, msIntoSlot uint64) error
@@ -175,7 +175,7 @@ func (s *DatabaseService) GetLatestValidatorRegistrations(timestampOnly bool) ([
 	return registrations, err
 }
 
-func (s *DatabaseService) SaveBuilderBlockSubmission(payload *common.BuilderSubmitBlockRequest, requestError, validationError error, receivedAt, eligibleAt time.Time, wasSimulated, saveExecPayload bool, profile common.Profile, optimisticSubmission bool) (entry *BuilderBlockSubmissionEntry, err error) {
+func (s *DatabaseService) SaveBuilderBlockSubmission(payload *common.VersionedSubmitBlockRequest, requestError, validationError error, receivedAt, eligibleAt time.Time, wasSimulated, saveExecPayload bool, profile common.Profile, optimisticSubmission bool) (entry *BuilderBlockSubmissionEntry, err error) {
 	// Save execution_payload: insert, or if already exists update to be able to return the id ('on conflict do nothing' doesn't return an id)
 	execPayloadEntry, err := PayloadToExecPayloadEntry(payload)
 	if err != nil {
@@ -200,6 +200,11 @@ func (s *DatabaseService) SaveBuilderBlockSubmission(payload *common.BuilderSubm
 		requestErrStr = requestError.Error()
 	}
 
+	submission, err := common.GetBlockSubmissionInfo(payload)
+	if err != nil {
+		return nil, err
+	}
+
 	blockSubmissionEntry := &BuilderBlockSubmissionEntry{
 		ReceivedAt:         NewNullTime(receivedAt),
 		EligibleAt:         NewNullTime(eligibleAt),
@@ -210,24 +215,24 @@ func (s *DatabaseService) SaveBuilderBlockSubmission(payload *common.BuilderSubm
 		SimError:     simErrStr,
 		SimReqError:  requestErrStr,
 
-		Signature: payload.Signature().String(),
+		Signature: submission.Signature.String(),
 
-		Slot:       payload.Slot(),
-		BlockHash:  payload.BlockHash(),
-		ParentHash: payload.ParentHash(),
+		Slot:       submission.BidTrace.Slot,
+		BlockHash:  submission.BidTrace.BlockHash.String(),
+		ParentHash: submission.BidTrace.ParentHash.String(),
 
-		BuilderPubkey:        payload.BuilderPubkey().String(),
-		ProposerPubkey:       payload.ProposerPubkey(),
-		ProposerFeeRecipient: payload.ProposerFeeRecipient(),
+		BuilderPubkey:        submission.BidTrace.BuilderPubkey.String(),
+		ProposerPubkey:       submission.BidTrace.ProposerPubkey.String(),
+		ProposerFeeRecipient: submission.BidTrace.ProposerFeeRecipient.String(),
 
-		GasUsed:  payload.GasUsed(),
-		GasLimit: payload.GasLimit(),
+		GasUsed:  submission.GasUsed,
+		GasLimit: submission.GasLimit,
 
-		NumTx: uint64(payload.NumTx()),
-		Value: payload.Value().String(),
+		NumTx: uint64(len(submission.Transactions)),
+		Value: submission.BidTrace.Value.Dec(),
 
-		Epoch:       payload.Slot() / common.SlotsPerEpoch,
-		BlockNumber: payload.BlockNumber(),
+		Epoch:       submission.BidTrace.Slot / common.SlotsPerEpoch,
+		BlockNumber: submission.BlockNumber,
 
 		DecodeDuration:       profile.Decode,
 		PrechecksDuration:    profile.Prechecks,
@@ -267,7 +272,7 @@ func (s *DatabaseService) GetExecutionPayloadEntryBySlotPkHash(slot uint64, prop
 	return entry, err
 }
 
-func (s *DatabaseService) SaveDeliveredPayload(bidTrace *common.BidTraceV2, signedBlindedBeaconBlock *common.SignedBlindedBeaconBlock, signedAt time.Time, publishMs uint64) error {
+func (s *DatabaseService) SaveDeliveredPayload(bidTrace *common.BidTraceV2WithBlobFields, signedBlindedBeaconBlock *common.VersionedSignedBlindedBeaconBlock, signedAt time.Time, publishMs uint64) error {
 	_signedBlindedBeaconBlock, err := json.Marshal(signedBlindedBeaconBlock)
 	if err != nil {
 		return err
@@ -294,12 +299,16 @@ func (s *DatabaseService) SaveDeliveredPayload(bidTrace *common.BidTraceV2, sign
 		NumTx: bidTrace.NumTx,
 		Value: bidTrace.Value.ToBig().String(),
 
+		NumBlobs:      bidTrace.NumBlobs,
+		BlobGasUsed:   bidTrace.BlobGasUsed,
+		ExcessBlobGas: bidTrace.ExcessBlobGas,
+
 		PublishMs: publishMs,
 	}
 
 	query := `INSERT INTO ` + vars.TableDeliveredPayload + `
-		(signed_at, signed_blinded_beacon_block, slot, epoch, builder_pubkey, proposer_pubkey, proposer_fee_recipient, parent_hash, block_hash, block_number, gas_used, gas_limit, num_tx, value, publish_ms) VALUES
-		(:signed_at, :signed_blinded_beacon_block, :slot, :epoch, :builder_pubkey, :proposer_pubkey, :proposer_fee_recipient, :parent_hash, :block_hash, :block_number, :gas_used, :gas_limit, :num_tx, :value, :publish_ms)
+		(signed_at, signed_blinded_beacon_block, slot, epoch, builder_pubkey, proposer_pubkey, proposer_fee_recipient, parent_hash, block_hash, block_number, gas_used, gas_limit, num_tx, value, num_blobs, blob_gas_used, excess_blob_gas, publish_ms) VALUES
+		(:signed_at, :signed_blinded_beacon_block, :slot, :epoch, :builder_pubkey, :proposer_pubkey, :proposer_fee_recipient, :parent_hash, :block_hash, :block_number, :gas_used, :gas_limit, :num_tx, :value, :num_blobs, :blob_gas_used, :excess_blob_gas, :publish_ms)
 		ON CONFLICT DO NOTHING`
 	_, err = s.DB.NamedExec(query, deliveredPayloadEntry)
 	return err
@@ -316,7 +325,7 @@ func (s *DatabaseService) GetRecentDeliveredPayloads(queryArgs GetPayloadsFilter
 		"builder_pubkey":  queryArgs.BuilderPubkey,
 	}
 
-	fields := "id, inserted_at, signed_at, slot, epoch, builder_pubkey, proposer_pubkey, proposer_fee_recipient, parent_hash, block_hash, block_number, num_tx, value, gas_used, gas_limit, publish_ms"
+	fields := "id, inserted_at, signed_at, slot, epoch, builder_pubkey, proposer_pubkey, proposer_fee_recipient, parent_hash, block_hash, block_number, num_tx, value, num_blobs, blob_gas_used, excess_blob_gas, gas_used, gas_limit, publish_ms"
 
 	whereConds := []string{}
 	if queryArgs.Slot > 0 {
@@ -370,7 +379,7 @@ func (s *DatabaseService) GetRecentDeliveredPayloads(queryArgs GetPayloadsFilter
 }
 
 func (s *DatabaseService) GetDeliveredPayloads(idFirst, idLast uint64) (entries []*DeliveredPayloadEntry, err error) {
-	query := `SELECT id, inserted_at, signed_at, slot, epoch, builder_pubkey, proposer_pubkey, proposer_fee_recipient, parent_hash, block_hash, block_number, num_tx, value, gas_used, gas_limit, publish_ms
+	query := `SELECT id, inserted_at, signed_at, slot, epoch, builder_pubkey, proposer_pubkey, proposer_fee_recipient, parent_hash, block_hash, block_number, num_tx, value, num_blobs, blob_gas_used, excess_blob_gas, gas_used, gas_limit, publish_ms
 	FROM ` + vars.TableDeliveredPayload + `
 	WHERE id >= $1 AND id <= $2
 	ORDER BY slot ASC`
@@ -536,24 +545,28 @@ func (s *DatabaseService) DeleteExecutionPayloads(idFirst, idLast uint64) error 
 	return err
 }
 
-func (s *DatabaseService) InsertBuilderDemotion(submitBlockRequest *common.BuilderSubmitBlockRequest, simError error) error {
-	_submitBlockRequest, err := json.Marshal(submitBlockRequest)
+func (s *DatabaseService) InsertBuilderDemotion(submitBlockRequest *common.VersionedSubmitBlockRequest, simError error) error {
+	_submitBlockRequest, err := json.Marshal(submitBlockRequest.Capella)
+	if err != nil {
+		return err
+	}
+	submission, err := common.GetBlockSubmissionInfo(submitBlockRequest)
 	if err != nil {
 		return err
 	}
 	builderDemotionEntry := BuilderDemotionEntry{
 		SubmitBlockRequest: NewNullString(string(_submitBlockRequest)),
 
-		Epoch: submitBlockRequest.Slot() / common.SlotsPerEpoch,
-		Slot:  submitBlockRequest.Slot(),
+		Epoch: submission.BidTrace.Slot / common.SlotsPerEpoch,
+		Slot:  submission.BidTrace.Slot,
 
-		BuilderPubkey:  submitBlockRequest.BuilderPubkey().String(),
-		ProposerPubkey: submitBlockRequest.ProposerPubkey(),
+		BuilderPubkey:  submission.BidTrace.BuilderPubkey.String(),
+		ProposerPubkey: submission.BidTrace.ProposerPubkey.String(),
 
-		Value:        submitBlockRequest.Value().String(),
-		FeeRecipient: submitBlockRequest.ProposerFeeRecipient(),
+		Value:        submission.BidTrace.Value.Dec(),
+		FeeRecipient: submission.BidTrace.ProposerFeeRecipient.String(),
 
-		BlockHash: submitBlockRequest.BlockHash(),
+		BlockHash: submission.BidTrace.BlockHash.String(),
 		SimError:  simError.Error(),
 	}
 
@@ -565,7 +578,7 @@ func (s *DatabaseService) InsertBuilderDemotion(submitBlockRequest *common.Build
 	return err
 }
 
-func (s *DatabaseService) UpdateBuilderDemotion(trace *common.BidTraceV2, signedBlock *common.SignedBeaconBlock, signedRegistration *types.SignedValidatorRegistration) error {
+func (s *DatabaseService) UpdateBuilderDemotion(trace *common.BidTraceV2WithBlobFields, signedBlock *common.VersionedSignedProposal, signedRegistration *builderApiV1.SignedValidatorRegistration) error {
 	_signedBeaconBlock, err := json.Marshal(signedBlock)
 	if err != nil {
 		return err
@@ -583,7 +596,7 @@ func (s *DatabaseService) UpdateBuilderDemotion(trace *common.BidTraceV2, signed
 	return err
 }
 
-func (s *DatabaseService) GetBuilderDemotion(trace *common.BidTraceV2) (*BuilderDemotionEntry, error) {
+func (s *DatabaseService) GetBuilderDemotion(trace *common.BidTraceV2WithBlobFields) (*BuilderDemotionEntry, error) {
 	query := `SELECT submit_block_request, signed_beacon_block, signed_validator_registration, epoch, slot, builder_pubkey, proposer_pubkey, value, fee_recipient, block_hash, sim_error FROM ` + vars.TableBuilderDemotions + `
 	WHERE slot=$1 AND builder_pubkey=$2 AND block_hash=$3`
 	entry := &BuilderDemotionEntry{}
