@@ -50,6 +50,7 @@ const (
 	ErrUnknownAncestor    = "unknown ancestor"
 	ErrProxyingRequest    = "proxying request failed"
 	ErrQueueTimeout       = "(Client.Timeout exceeded while awaiting headers)"
+	ErrBlockReorg         = "block requires a reorg"
 )
 
 var (
@@ -668,7 +669,7 @@ func (api *RelayAPI) processOptimisticBlock(opts blockSimOptions, simResultC cha
 		}
 
 		// Check for errors for which we will not demote unless the block wins the slot
-		ignoreError := strings.Contains(demotionErr.Error(), ErrUnknownAncestor) || strings.Contains(demotionErr.Error(), ErrProxyingRequest) || strings.Contains(demotionErr.Error(), ErrQueueTimeout)
+		ignoreError := strings.Contains(demotionErr.Error(), ErrUnknownAncestor) || strings.Contains(demotionErr.Error(), ErrProxyingRequest) || strings.Contains(demotionErr.Error(), ErrQueueTimeout) || strings.Contains(demotionErr.Error(), ErrBlockReorg)
 		if ignoreError {
 			opts.log.WithError(demotionErr).Warn("Ignorable validation error, deferring demotion check")
 			blockHash := opts.req.BuilderSubmitBlockRequest.BlockHash()
