@@ -362,13 +362,13 @@ func (r *RedisCache) GetPayloadContents(slot uint64, proposerPubkey, blockHash s
 	return resp, err
 }
 
-func (r *RedisCache) SavePayloadContentsDeneb(ctx context.Context, tx redis.Pipeliner, slot uint64, proposerPubkey, blockHash string, execPayload *builderApiDeneb.ExecutionPayloadAndBlobsBundle) (err error) {
+func (r *RedisCache) SavePayloadContentsDeneb(ctx context.Context, pipeliner redis.Pipeliner, slot uint64, proposerPubkey, blockHash string, execPayload *builderApiDeneb.ExecutionPayloadAndBlobsBundle) (err error) {
 	key := r.keyPayloadContentsDeneb(slot, proposerPubkey, blockHash)
 	b, err := execPayload.MarshalSSZ()
 	if err != nil {
 		return err
 	}
-	return tx.Set(ctx, key, b, expiryBidCache).Err()
+	return r.SetPL(ctx, pipeliner, key, b, expiryBidCache)
 }
 
 func (r *RedisCache) GetPayloadContentsDeneb(slot uint64, proposerPubkey, blockHash string) (*builderApi.VersionedSubmitBlindedBlockResponse, error) {
