@@ -12,6 +12,7 @@ import (
 	"math/big"
 	"net/http"
 	_ "net/http/pprof"
+	"net/url"
 	"os"
 	"sort"
 	"strconv"
@@ -90,6 +91,7 @@ var (
 	// various timings
 	timeoutGetPayloadRetryMs  = cli.GetEnvInt("GETPAYLOAD_RETRY_TIMEOUT_MS", 100)
 	getHeaderRequestCutoffMs  = cli.GetEnvInt("GETHEADER_REQUEST_CUTOFF_MS", 3000)
+	getHeaderResponseDelayMs  = cli.GetEnvInt("GETHEADER_RESPONSE_DELAY_MS", 0)
 	getPayloadRequestCutoffMs = cli.GetEnvInt("GETPAYLOAD_REQUEST_CUTOFF_MS", 4000)
 	getPayloadResponseDelayMs = cli.GetEnvInt("GETPAYLOAD_RESPONSE_DELAY_MS", 1000)
 
@@ -112,6 +114,13 @@ var (
 	// user-agents which shouldn't receive bids
 	apiNoHeaderUserAgents = common.GetEnvStrSlice("NO_HEADER_USERAGENTS", []string{
 		"mev-boost/v1.5.0 Go-http-client/1.1", // Prysm v4.0.1 (Shapella signing issue)
+	})
+
+	// user-agent strings to match for those who should receive delayed bids
+	apiDelayedHeaderUserAgents = common.GetEnvStrSlice("DELAYED_HEADER_USERAGENTS", []string{
+		"mev-boost",
+		"Vouch",
+		"delay",
 	})
 )
 
@@ -1148,6 +1157,40 @@ func (api *RelayAPI) handleRegisterValidator(w http.ResponseWriter, req *http.Re
 	w.WriteHeader(http.StatusOK)
 }
 
+func (api *RelayAPI) computeDelay(ua string, args url.Values, msIntoSlot int64) uint64 {
+	// By default, delay responses only to likely proposer user agents
+	delayMs := uint64(0)
+	for _, delayedUA := range apiDelayedHeaderUserAgents {
+		if strings.Contains(ua, delayedUA) {
+			delayMs = uint64(getHeaderResponseDelayMs)
+			break
+		}
+	}
+
+	// Parse user delay parameters
+	cutoff := uint64(getHeaderRequestCutoffMs)
+	if args.Get("headerCutoff") != "" && getHeaderResponseDelayMs != 0 {
+		userCutoff, err := strconv.ParseUint(args.Get("headerCutoff"), 10, 64)
+		if err == nil && userCutoff < uint64(getHeaderRequestCutoffMs) {
+			cutoff = userCutoff
+		}
+	}
+
+	if args.Get("headerDelay") != "" && getHeaderResponseDelayMs != 0 {
+		userDelay, err := strconv.ParseUint(args.Get("headerDelay"), 10, 64)
+		if err == nil {
+			delayMs = userDelay
+		}
+	}
+
+	// Do not allow delay past cutoff
+	if cutoff-uint64(msIntoSlot) < delayMs {
+		delayMs = cutoff - uint64(msIntoSlot)
+	}
+
+	return delayMs
+}
+
 func (api *RelayAPI) handleGetHeader(w http.ResponseWriter, req *http.Request) {
 	vars := mux.Vars(req)
 	slotStr := vars["slot"]
@@ -1214,6 +1257,10 @@ func (api *RelayAPI) handleGetHeader(w http.ResponseWriter, req *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
+
+	// Delay the response if parameters call for it
+	delayMs := api.computeDelay(ua, req.URL.Query(), msIntoSlot)
+	time.Sleep(time.Duration(delayMs) * time.Millisecond)
 
 	bid, err := api.redis.GetBestBid(slot, parentHashHex, proposerPubkeyHex)
 	if err != nil {
