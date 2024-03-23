@@ -21,8 +21,9 @@ import (
 )
 
 var (
-	redisScheme = "redis://"
-	redisPrefix = "boost-relay"
+	redisScheme  = "redis://"
+	redisPrefix  = "boost-relay"
+	redisBidHash = "bid-stats"
 
 	expiryBidCache = 45 * time.Second
 	expiryLock     = 24 * time.Second
@@ -107,6 +108,9 @@ type RedisCache struct {
 	keyLastHashDelivered  string
 
 	currentSlot uint64
+
+	// channels
+	topBidValueChannel string
 }
 
 func NewRedisCache(prefix, redisURI, readonlyURI string) (*RedisCache, error) {
@@ -150,6 +154,8 @@ func NewRedisCache(prefix, redisURI, readonlyURI string) (*RedisCache, error) {
 		keyLastSlotDelivered:  fmt.Sprintf("%s/%s:last-slot-delivered", redisPrefix, prefix),
 		keyLastHashDelivered:  fmt.Sprintf("%s/%s:last-hash-delivered", redisPrefix, prefix),
 		currentSlot:           0,
+
+		topBidValueChannel: fmt.Sprintf("%s/%s:top-bid-updates", redisPrefix, prefix),
 	}, nil
 }
 
@@ -620,6 +626,17 @@ func (r *RedisCache) SaveBidAndUpdateTopBid(ctx context.Context, pipeliner redis
 		return state, err
 	}
 	state.IsNewTopBid = submission.BidTrace.Value.ToBig().Cmp(state.TopBidValue) == 0
+
+	// If new top bid, publish it to channel
+	if state.IsNewTopBid {
+		err = r.PublishTopBidUpdate(ctx, pipeliner, submission)
+		if err != nil {
+			return state, err
+		}
+	}
+	// Execute publishing
+	_, err = pipeliner.Exec(ctx)
+
 	// An Exec happens in _updateTopBid.
 	state.WasBidSaved = true
 
@@ -727,6 +744,19 @@ func (r *RedisCache) _updateTopBid(ctx context.Context, pipeliner redis.Pipeline
 
 	_, err = pipeliner.Exec(ctx)
 	return state, err
+}
+
+func (r *RedisCache) PublishTopBidUpdate(ctx context.Context, pipeliner redis.Pipeliner, submission *common.BlockSubmissionInfo) error {
+	timestamp := time.Now().Format(time.RFC3339)
+	message := fmt.Sprintf("%s_%d_%s_%s_%s_%s",
+		timestamp,
+		submission.BidTrace.Slot,
+		submission.BidTrace.ParentHash.String(),
+		submission.BidTrace.ProposerPubkey.String(),
+		submission.BidTrace.BuilderPubkey.String(),
+		submission.BidTrace.Value.ToBig())
+
+	return pipeliner.Publish(ctx, r.topBidValueChannel, message).Err()
 }
 
 // GetTopBidValue gets the top bid value for a given slot+parent+proposer combination
