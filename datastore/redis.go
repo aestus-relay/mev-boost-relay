@@ -107,10 +107,10 @@ type RedisCache struct {
 	keyLastSlotDelivered  string
 	keyLastHashDelivered  string
 
-	currentSlot uint64
-
 	// channels
-	topBidValueChannel string
+	channelTopBid string
+
+	currentSlot uint64
 }
 
 func NewRedisCache(prefix, redisURI, readonlyURI string) (*RedisCache, error) {
@@ -155,7 +155,7 @@ func NewRedisCache(prefix, redisURI, readonlyURI string) (*RedisCache, error) {
 		keyLastHashDelivered:  fmt.Sprintf("%s/%s:last-hash-delivered", redisPrefix, prefix),
 		currentSlot:           0,
 
-		topBidValueChannel: fmt.Sprintf("%s/%s:top-bid-updates", redisPrefix, prefix),
+		channelTopBid: fmt.Sprintf("%s/%s:top-bid-updates", redisPrefix, prefix),
 	}, nil
 }
 
@@ -627,16 +627,6 @@ func (r *RedisCache) SaveBidAndUpdateTopBid(ctx context.Context, pipeliner redis
 	}
 	state.IsNewTopBid = submission.BidTrace.Value.ToBig().Cmp(state.TopBidValue) == 0
 
-	// If new top bid, publish it to channel
-	if state.IsNewTopBid {
-		err = r.PublishTopBidUpdate(ctx, pipeliner, submission)
-		if err != nil {
-			return state, err
-		}
-	}
-	// Execute publishing
-	_, err = pipeliner.Exec(ctx)
-
 	// An Exec happens in _updateTopBid.
 	state.WasBidSaved = true
 
@@ -742,21 +732,44 @@ func (r *RedisCache) _updateTopBid(ctx context.Context, pipeliner redis.Pipeline
 		return state, err
 	}
 
+	// If top bid was updated, publish to top bid channel
+	if state.WasTopBidUpdated {
+		c := pipeliner.Get(ctx, keyTopBid)
+		_, err := pipeliner.Exec(ctx)
+		if err != nil {
+			return state, err
+		}
+		topBidStr, err := c.Result()
+		if err != nil {
+			return state, err
+		}
+		err = r.PublishTopBidUpdate(ctx, pipeliner, r.channelTopBid, topBidStr, slot)
+		return state, err
+	}
+
 	_, err = pipeliner.Exec(ctx)
 	return state, err
 }
 
-func (r *RedisCache) PublishTopBidUpdate(ctx context.Context, pipeliner redis.Pipeliner, submission *common.BlockSubmissionInfo) error {
-	timestamp := time.Now().Format(time.RFC3339)
-	message := fmt.Sprintf("%s_%d_%s_%s_%s_%s",
-		timestamp,
-		submission.BidTrace.Slot,
-		submission.BidTrace.ParentHash.String(),
-		submission.BidTrace.ProposerPubkey.String(),
-		submission.BidTrace.BuilderPubkey.String(),
-		submission.BidTrace.Value.ToBig())
+func (r *RedisCache) PublishTopBidUpdate(ctx context.Context, pipeliner redis.Pipeliner, channel, topBidStr string, slot uint64) error {
+	// Parse JSON to add slot info
+	var topBidJSON interface{}
+	if err := json.Unmarshal([]byte(topBidStr), &topBidJSON); err != nil {
+		return err
+	}
+	slotObjJSON := map[string]interface{}{
+		"slot": slot,
+		"getHeaderResponse": topBidJSON,
+	}
 
-	return pipeliner.Publish(ctx, r.topBidValueChannel, message).Err()
+	slotObj, err := json.Marshal(slotObjJSON)
+	if err != nil {
+		return err
+	}
+
+	c := r.client.Publish(ctx, r.channelTopBid, string(slotObj))
+	_, err = c.Result()
+	return err
 }
 
 // GetTopBidValue gets the top bid value for a given slot+parent+proposer combination
