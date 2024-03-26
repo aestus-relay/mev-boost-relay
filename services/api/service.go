@@ -89,11 +89,12 @@ var (
 	numValidatorRegProcessors = cli.GetEnvInt("NUM_VALIDATOR_REG_PROCESSORS", 10)
 
 	// various timings
-	timeoutGetPayloadRetryMs  = cli.GetEnvInt("GETPAYLOAD_RETRY_TIMEOUT_MS", 100)
-	getHeaderRequestCutoffMs  = cli.GetEnvInt("GETHEADER_REQUEST_CUTOFF_MS", 3000)
-	getHeaderResponseDelayMs  = cli.GetEnvInt("GETHEADER_RESPONSE_DELAY_MS", 0)
-	getPayloadRequestCutoffMs = cli.GetEnvInt("GETPAYLOAD_REQUEST_CUTOFF_MS", 4000)
-	getPayloadResponseDelayMs = cli.GetEnvInt("GETPAYLOAD_RESPONSE_DELAY_MS", 1000)
+	timeoutGetPayloadRetryMs   = cli.GetEnvInt("GETPAYLOAD_RETRY_TIMEOUT_MS", 100)
+	getHeaderRequestCutoffMs   = cli.GetEnvInt("GETHEADER_REQUEST_CUTOFF_MS", 3000)
+	getHeaderResponseMaxSlotMs = cli.GetEnvInt("GETHEADER_REQUEST_MAX_SLOT_MS", 2000)
+	getHeaderResponseDelayMs   = cli.GetEnvInt("GETHEADER_RESPONSE_DELAY_MS", 0)
+	getPayloadRequestCutoffMs  = cli.GetEnvInt("GETPAYLOAD_REQUEST_CUTOFF_MS", 4000)
+	getPayloadResponseDelayMs  = cli.GetEnvInt("GETPAYLOAD_RESPONSE_DELAY_MS", 1000)
 
 	// api settings
 	apiReadTimeoutMs       = cli.GetEnvInt("API_TIMEOUT_READ_MS", 1500)
@@ -931,6 +932,10 @@ func (api *RelayAPI) Respond(w http.ResponseWriter, code int, response any) {
 }
 
 func (api *RelayAPI) handleStatus(w http.ResponseWriter, req *http.Request) {
+	// Delay the response if parameters call for it
+	delayMs := api.computeDelay(req.UserAgent(), req.URL.Query(), 0)
+	time.Sleep(time.Duration(delayMs) * time.Millisecond)
+
 	w.WriteHeader(http.StatusOK)
 }
 
@@ -1168,10 +1173,10 @@ func (api *RelayAPI) computeDelay(ua string, args url.Values, msIntoSlot int64) 
 	}
 
 	// Parse user delay parameters
-	cutoff := uint64(getHeaderRequestCutoffMs)
+	cutoff := uint64(getHeaderResponseMaxSlotMs)
 	if args.Get("headerCutoff") != "" && getHeaderResponseDelayMs != 0 {
 		userCutoff, err := strconv.ParseUint(args.Get("headerCutoff"), 10, 64)
-		if err == nil && userCutoff < uint64(getHeaderRequestCutoffMs) {
+		if err == nil && userCutoff <= uint64(getHeaderRequestCutoffMs) {
 			cutoff = userCutoff
 		}
 	}
@@ -1184,7 +1189,7 @@ func (api *RelayAPI) computeDelay(ua string, args url.Values, msIntoSlot int64) 
 	}
 
 	// Do not allow delay past cutoff
-	if cutoff-uint64(msIntoSlot) < delayMs {
+	if int64(cutoff)-msIntoSlot < int64(delayMs) {
 		delayMs = cutoff - uint64(msIntoSlot)
 	}
 
