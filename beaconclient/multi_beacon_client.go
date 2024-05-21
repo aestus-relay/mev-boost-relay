@@ -55,6 +55,7 @@ type IBeaconInstance interface {
 	GetStateValidators(stateID string) (*GetStateValidatorsResponse, error)
 	GetProposerDuties(epoch uint64) (*ProposerDutiesResponse, error)
 	GetURI() string
+	GetPublishURI() string
 	PublishBlock(block *common.VersionedSignedProposal, broadcastMode BroadcastMode) (code int, err error)
 	GetGenesis() (*GetGenesisResponse, error)
 	GetSpec() (spec *GetSpecResponse, err error)
@@ -271,7 +272,7 @@ func (c *MultiBeaconClient) PublishBlock(block *common.VersionedSignedProposal) 
 	resChans := make(chan publishResp, len(clients))
 
 	for i, client := range clients {
-		log := log.WithField("uri", client.GetURI())
+		log := log.WithField("uri", client.GetPublishURI())
 		log.Debug("publishing block")
 		go func(index int, client IBeaconInstance) {
 			code, err := client.PublishBlock(block, c.broadcastMode)
@@ -286,7 +287,7 @@ func (c *MultiBeaconClient) PublishBlock(block *common.VersionedSignedProposal) 
 	var lastErrPublishResp publishResp
 	for i := 0; i < len(clients); i++ {
 		res := <-resChans
-		log = log.WithField("beacon", clients[res.index].GetURI())
+		log = log.WithField("beacon", clients[res.index].GetPublishURI())
 		if res.err != nil {
 			log.WithField("statusCode", res.code).WithError(res.err).Warn("failed to publish block")
 			lastErrPublishResp = res
@@ -294,7 +295,7 @@ func (c *MultiBeaconClient) PublishBlock(block *common.VersionedSignedProposal) 
 		} else if res.code == 202 {
 			// Should the block fail full validation, a separate success response code (202) is used to indicate that the block was successfully broadcast but failed integration.
 			// https://ethereum.github.io/beacon-APIs/?urls.primaryName=dev#/Beacon/publishBlock
-			log.WithField("statusCode", res.code).WithError(res.err).Error("block failed validation but was still broadcast")
+			log.WithField("statusCode", res.code).WithError(res.err).Warn("CL client failed block integration, but block was successfully broadcast")
 			lastErrPublishResp = res
 			continue
 		}
@@ -305,6 +306,9 @@ func (c *MultiBeaconClient) PublishBlock(block *common.VersionedSignedProposal) 
 		return res.code, nil
 	}
 
+	if lastErrPublishResp.err == nil {
+		return lastErrPublishResp.code, nil
+	}
 	log.Error("failed to publish block on any CL node")
 	return lastErrPublishResp.code, fmt.Errorf("last error: %w", lastErrPublishResp.err)
 }

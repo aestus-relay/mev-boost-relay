@@ -34,10 +34,12 @@ import (
 	"github.com/flashbots/mev-boost-relay/common"
 	"github.com/flashbots/mev-boost-relay/database"
 	"github.com/flashbots/mev-boost-relay/datastore"
+	"github.com/flashbots/mev-boost-relay/metrics"
 	"github.com/go-redis/redis/v9"
 	"github.com/gorilla/mux"
 	"github.com/holiman/uint256"
 	"github.com/pkg/errors"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/sirupsen/logrus"
 	uberatomic "go.uber.org/atomic"
 	"golang.org/x/exp/slices"
@@ -228,6 +230,10 @@ type RelayAPI struct {
 
 // NewRelayAPI creates a new service. if builders is nil, allow any builder
 func NewRelayAPI(opts RelayAPIOpts) (api *RelayAPI, err error) {
+	if err := metrics.Setup(context.Background()); err != nil {
+		return nil, err
+	}
+
 	if opts.Log == nil {
 		return nil, ErrMissingLogOpt
 	}
@@ -335,6 +341,7 @@ func (api *RelayAPI) getRouter() http.Handler {
 	r.HandleFunc("/", api.handleRoot).Methods(http.MethodGet)
 	r.HandleFunc("/livez", api.handleLivez).Methods(http.MethodGet)
 	r.HandleFunc("/readyz", api.handleReadyz).Methods(http.MethodGet)
+	r.Handle("/metrics", promhttp.Handler()).Methods(http.MethodGet)
 
 	// Proposer API
 	if api.opts.ProposerAPI {
@@ -611,7 +618,12 @@ func (api *RelayAPI) demoteBuilder(pubkey string, req *common.VersionedSubmitBlo
 		api.log.Error(fmt.Errorf("error setting builder: %v status: %w", pubkey, err))
 	}
 	// Write to demotions table.
-	api.log.WithFields(logrus.Fields{"builder_pubkey": pubkey}).Info("demoting builder")
+	api.log.WithFields(logrus.Fields{
+		"builderPubkey": pubkey,
+		"slot":          req.Slot,
+		"blockHash":     req.BlockHash,
+		"demotionErr":   simError.Error(),
+	}).Info("demoting builder")
 	bidTrace, err := req.BidTrace()
 	if err != nil {
 		api.log.WithError(err).Warn("failed to get bid trace from submit block request")
@@ -702,7 +714,7 @@ func (api *RelayAPI) processPayloadAttributes(payloadAttributes beaconclient.Pay
 
 	// discard payload attributes if already known
 	api.payloadAttributesLock.RLock()
-	_, ok := api.payloadAttributes[payloadAttributes.Data.ParentBlockHash]
+	_, ok := api.payloadAttributes[getPayloadAttributesKey(payloadAttributes.Data.ParentBlockHash, payloadAttrSlot)]
 	api.payloadAttributesLock.RUnlock()
 
 	if ok {
@@ -742,12 +754,12 @@ func (api *RelayAPI) processPayloadAttributes(payloadAttributes beaconclient.Pay
 	// Step 1: clean up old ones
 	for parentBlockHash, attr := range api.payloadAttributes {
 		if attr.slot < apiHeadSlot {
-			delete(api.payloadAttributes, parentBlockHash)
+			delete(api.payloadAttributes, getPayloadAttributesKey(parentBlockHash, attr.slot))
 		}
 	}
 
 	// Step 2: save new one
-	api.payloadAttributes[payloadAttributes.Data.ParentBlockHash] = payloadAttributesHelper{
+	api.payloadAttributes[getPayloadAttributesKey(payloadAttributes.Data.ParentBlockHash, payloadAttrSlot)] = payloadAttributesHelper{
 		slot:              payloadAttrSlot,
 		parentHash:        payloadAttributes.Data.ParentBlockHash,
 		withdrawalsRoot:   withdrawalsRoot,
@@ -1275,6 +1287,11 @@ func (api *RelayAPI) handleGetPayload(w http.ResponseWriter, req *http.Request) 
 			"timestampRequestFin": time.Now().UTC().UnixMilli(),
 			"requestDurationMs":   time.Since(receivedAt).Milliseconds(),
 		}).Info("request finished")
+
+		metrics.GetPayloadLatencyHistogram.Record(
+			req.Context(),
+			float64(time.Since(receivedAt).Milliseconds()),
+		)
 	}()
 
 	// Read the body first, so we can decode it later
@@ -1492,14 +1509,16 @@ func (api *RelayAPI) handleGetPayload(w http.ResponseWriter, req *http.Request) 
 			// Still not found! Error out now.
 			if errors.Is(err, datastore.ErrExecutionPayloadNotFound) {
 				// Couldn't find the execution payload, maybe it never was submitted to our relay! Check that now
-				_, err := api.db.GetBlockSubmissionEntry(uint64(slot), proposerPubkey.String(), blockHash.String())
+				bid, err := api.db.GetBlockSubmissionEntry(uint64(slot), proposerPubkey.String(), blockHash.String())
 				if errors.Is(err, sql.ErrNoRows) {
 					log.Warn("failed getting execution payload (2/2) - payload not found, block was never submitted to this relay")
 					api.RespondError(w, http.StatusBadRequest, "no execution payload for this request - block was never seen by this relay")
 				} else if err != nil {
 					log.WithError(err).Error("failed getting execution payload (2/2) - payload not found, and error on checking bids")
-				} else {
+				} else if bid.EligibleAt.Valid {
 					log.Error("failed getting execution payload (2/2) - payload not found, but found bid in database")
+				} else {
+					log.Info("found bid but payload was never saved as bid was ineligible being below floor value")
 				}
 			} else { // some other error
 				log.WithError(err).Error("failed getting execution payload (2/2) - error")
@@ -1577,15 +1596,17 @@ func (api *RelayAPI) handleGetPayload(w http.ResponseWriter, req *http.Request) 
 		return
 	}
 	code, err := api.beaconClient.PublishBlock(signedBeaconBlock) // errors are logged inside
-	if err != nil || code != http.StatusOK {
+	if err != nil || (code != http.StatusOK && code != http.StatusAccepted) {
 		log.WithError(err).WithField("code", code).Error("failed to publish block")
 		api.RespondError(w, http.StatusBadRequest, "failed to publish block")
 		return
 	}
+
 	timeAfterPublish := time.Now().UTC().UnixMilli()
 	msNeededForPublishing = uint64(timeAfterPublish - timeBeforePublish)
 	log = log.WithField("timestampAfterPublishing", timeAfterPublish)
 	log.WithField("msNeededForPublishing", msNeededForPublishing).Info("block published through beacon node")
+	metrics.PublishBlockLatencyHistogram.Record(req.Context(), float64(msNeededForPublishing))
 
 	// give the beacon network some time to propagate the block
 	time.Sleep(time.Duration(getPayloadResponseDelayMs) * time.Millisecond)
@@ -1651,12 +1672,14 @@ func (api *RelayAPI) checkSubmissionFeeRecipient(w http.ResponseWriter, log *log
 
 func (api *RelayAPI) checkSubmissionPayloadAttrs(w http.ResponseWriter, log *logrus.Entry, submission *common.BlockSubmissionInfo) (payloadAttributesHelper, bool) {
 	api.payloadAttributesLock.RLock()
-	attrs, ok := api.payloadAttributes[submission.BidTrace.ParentHash.String()]
+	attrs, ok := api.payloadAttributes[getPayloadAttributesKey(submission.BidTrace.ParentHash.String(), submission.BidTrace.Slot)]
 	api.payloadAttributesLock.RUnlock()
 	if !ok || submission.BidTrace.Slot != attrs.slot {
-		log.Info(ok)
-		log.Info("payload", submission.BidTrace.Slot, "attrs", attrs.slot)
-		log.Warn("payload attributes not (yet) known")
+		log.WithFields(logrus.Fields{
+			"attributesFound": ok,
+			"payloadSlot":     submission.BidTrace.Slot,
+			"attrsSlot":       attrs.slot,
+		}).Warn("payload attributes not (yet) known")
 		api.RespondError(w, http.StatusBadRequest, "payload attributes not (yet) known")
 		return attrs, false
 	}
@@ -1720,7 +1743,7 @@ func (api *RelayAPI) checkSubmissionSlotDetails(w http.ResponseWriter, log *logr
 func (api *RelayAPI) checkBuilderEntry(w http.ResponseWriter, log *logrus.Entry, builderPubkey phase0.BLSPubKey) (*blockBuilderCacheEntry, bool) {
 	builderEntry, ok := api.blockBuildersCache[builderPubkey.String()]
 	if !ok {
-		log.Warnf("unable to read builder: %s from the builder cache, using low-prio and no collateral", builderPubkey.String())
+		log.Infof("unable to read builder: %s from the builder cache, using low-prio and no collateral", builderPubkey.String())
 		builderEntry = &blockBuilderCacheEntry{
 			status: common.BuilderStatus{
 				IsHighPrio:    false,
@@ -1912,6 +1935,10 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 		return
 	}
 
+	nextTime = time.Now().UTC()
+	pf.PayloadLoad = uint64(nextTime.Sub(prevTime).Microseconds())
+	prevTime = nextTime
+
 	payload := new(common.VersionedSubmitBlockRequest)
 
 	// Check for SSZ encoding
@@ -1984,10 +2011,7 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 		return
 	}
 
-	log = log.WithFields(logrus.Fields{
-		"builderIsHighPrio":     builderEntry.status.IsHighPrio,
-		"timestampAfterChecks1": time.Now().UTC().UnixMilli(),
-	})
+	log = log.WithField("builderIsHighPrio", builderEntry.status.IsHighPrio)
 
 	gasLimit, ok := api.checkSubmissionFeeRecipient(w, log, submission.BidTrace)
 	if !ok {
@@ -2009,8 +2033,6 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 		return
 	}
 
-	log = log.WithField("timestampBeforeAttributesCheck", time.Now().UTC().UnixMilli())
-
 	attrs, ok := api.checkSubmissionPayloadAttrs(w, log, submission)
 	if !ok {
 		return
@@ -2031,19 +2053,14 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 		return
 	}
 
+	log = log.WithField("timestampBeforeCheckingFloorBid", time.Now().UTC().UnixMilli())
+
 	// Create the redis pipeline tx
 	tx := api.redis.NewTxPipeline()
 
 	// channel to send simulation result to the deferred function
 	simResultC := make(chan *blockSimResult, 1)
 	var eligibleAt time.Time // will be set once the bid is ready
-
-	submission, err = common.GetBlockSubmissionInfo(payload)
-	if err != nil {
-		log.WithError(err).Warn("missing fields in submit block request")
-		api.RespondError(w, http.StatusBadRequest, err.Error())
-		return
-	}
 
 	bfOpts := bidFloorOpts{
 		w:                    w,
@@ -2057,6 +2074,8 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 	if !ok {
 		return
 	}
+
+	log = log.WithField("timestampAfterCheckingFloorBid", time.Now().UTC().UnixMilli())
 
 	// Deferred saving of the builder submission to database (whenever this function ends)
 	defer func() {
@@ -2085,6 +2104,8 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 	// THE BID WILL BE SIMULATED SHORTLY
 	// ---------------------------------
 
+	log = log.WithField("timestampBeforeCheckingTopBid", time.Now().UTC().UnixMilli())
+
 	// Get the latest top bid value from Redis
 	bidIsTopBid := false
 	topBidValue, err := api.redis.GetTopBidValue(context.Background(), tx, submission.BidTrace.Slot, submission.BidTrace.ParentHash.String(), submission.BidTrace.ProposerPubkey.String())
@@ -2098,6 +2119,12 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 		})
 	}
 
+	log = log.WithField("timestampAfterCheckingTopBid", time.Now().UTC().UnixMilli())
+
+	nextTime = time.Now().UTC()
+	pf.Prechecks = uint64(nextTime.Sub(prevTime).Microseconds())
+	prevTime = nextTime
+
 	// Simulate the block submission and save to db
 	fastTrackValidation := builderEntry.status.IsHighPrio && bidIsTopBid && !isLargeRequest
 	timeBeforeValidation := time.Now().UTC()
@@ -2106,10 +2133,6 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 		"timestampBeforeValidation": timeBeforeValidation.UTC().UnixMilli(),
 		"fastTrackValidation":       fastTrackValidation,
 	})
-
-	nextTime = time.Now().UTC()
-	pf.Prechecks = uint64(nextTime.Sub(prevTime).Microseconds())
-	prevTime = nextTime
 
 	// Construct simulation request
 	opts := blockSimOptions{
@@ -2329,13 +2352,13 @@ func (api *RelayAPI) handleDataProposerPayloadDelivered(w http.ResponseWriter, r
 		api.RespondError(w, http.StatusBadRequest, "cannot specify both slot and cursor")
 		return
 	} else if args.Get("slot") != "" {
-		filters.Slot, err = strconv.ParseUint(args.Get("slot"), 10, 64)
+		filters.Slot, err = strconv.ParseInt(args.Get("slot"), 10, 64)
 		if err != nil {
 			api.RespondError(w, http.StatusBadRequest, "invalid slot argument")
 			return
 		}
 	} else if args.Get("cursor") != "" {
-		filters.Cursor, err = strconv.ParseUint(args.Get("cursor"), 10, 64)
+		filters.Cursor, err = strconv.ParseInt(args.Get("cursor"), 10, 64)
 		if err != nil {
 			api.RespondError(w, http.StatusBadRequest, "invalid cursor argument")
 			return
@@ -2352,7 +2375,7 @@ func (api *RelayAPI) handleDataProposerPayloadDelivered(w http.ResponseWriter, r
 	}
 
 	if args.Get("block_number") != "" {
-		filters.BlockNumber, err = strconv.ParseUint(args.Get("block_number"), 10, 64)
+		filters.BlockNumber, err = strconv.ParseInt(args.Get("block_number"), 10, 64)
 		if err != nil {
 			api.RespondError(w, http.StatusBadRequest, "invalid block_number argument")
 			return
@@ -2396,7 +2419,7 @@ func (api *RelayAPI) handleDataProposerPayloadDelivered(w http.ResponseWriter, r
 
 	deliveredPayloads, err := api.db.GetRecentDeliveredPayloads(filters)
 	if err != nil {
-		api.log.WithError(err).Error("error getting recent payloads")
+		api.log.WithError(err).Error("error getting recently delivered payloads")
 		api.RespondError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -2427,7 +2450,7 @@ func (api *RelayAPI) handleDataBuilderBidsReceived(w http.ResponseWriter, req *h
 	}
 
 	if args.Get("slot") != "" {
-		filters.Slot, err = strconv.ParseUint(args.Get("slot"), 10, 64)
+		filters.Slot, err = strconv.ParseInt(args.Get("slot"), 10, 64)
 		if err != nil {
 			api.RespondError(w, http.StatusBadRequest, "invalid slot argument")
 			return
@@ -2444,7 +2467,7 @@ func (api *RelayAPI) handleDataBuilderBidsReceived(w http.ResponseWriter, req *h
 	}
 
 	if args.Get("block_number") != "" {
-		filters.BlockNumber, err = strconv.ParseUint(args.Get("block_number"), 10, 64)
+		filters.BlockNumber, err = strconv.ParseInt(args.Get("block_number"), 10, 64)
 		if err != nil {
 			api.RespondError(w, http.StatusBadRequest, "invalid block_number argument")
 			return
@@ -2466,7 +2489,7 @@ func (api *RelayAPI) handleDataBuilderBidsReceived(w http.ResponseWriter, req *h
 	}
 
 	if args.Get("limit") != "" {
-		_limit, err := strconv.ParseUint(args.Get("limit"), 10, 64)
+		_limit, err := strconv.ParseInt(args.Get("limit"), 10, 64)
 		if err != nil {
 			api.RespondError(w, http.StatusBadRequest, "invalid limit argument")
 			return
@@ -2480,7 +2503,7 @@ func (api *RelayAPI) handleDataBuilderBidsReceived(w http.ResponseWriter, req *h
 
 	blockSubmissions, err := api.db.GetBuilderSubmissions(filters)
 	if err != nil {
-		api.log.WithError(err).Error("error getting recent payloads")
+		api.log.WithError(err).Error("error getting recent builder submissions")
 		api.RespondError(w, http.StatusInternalServerError, err.Error())
 		return
 	}

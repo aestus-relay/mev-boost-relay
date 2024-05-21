@@ -23,30 +23,31 @@ func NewNullString(s string) sql.NullString {
 	}
 }
 
+// NewNullTime returns a sql.NullTime with the given time.Time. If the time is
+// the zero value, the NullTime is invalid.
 func NewNullTime(t time.Time) sql.NullTime {
 	return sql.NullTime{
 		Time:  t,
-		Valid: true,
+		Valid: t != time.Time{},
 	}
 }
 
 type GetPayloadsFilters struct {
-	Slot           uint64
-	Cursor         uint64
+	Slot           int64
+	Cursor         int64
 	Limit          uint64
 	BlockHash      string
-	BlockNumber    uint64
+	BlockNumber    int64
 	ProposerPubkey string
 	BuilderPubkey  string
 	OrderByValue   int8
 }
 
 type GetBuilderSubmissionsFilters struct {
-	Slot        uint64
-	Limit       uint64
-	BlockHash   string
-	BlockNumber uint64
-	// Cursor      uint64
+	Slot          int64
+	Limit         int64
+	BlockHash     string
+	BlockNumber   int64
 	BuilderPubkey string
 }
 
