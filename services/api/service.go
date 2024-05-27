@@ -36,7 +36,7 @@ import (
 	"github.com/flashbots/mev-boost-relay/database"
 	"github.com/flashbots/mev-boost-relay/datastore"
 	"github.com/flashbots/mev-boost-relay/metrics"
-	"github.com/go-redis/redis/v9"
+	"github.com/redis/go-redis/v9"
 	"github.com/gorilla/mux"
 	"github.com/holiman/uint256"
 	"github.com/pkg/errors"
@@ -2301,14 +2301,13 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 
 	// Add fields to logs
 	log = log.WithFields(logrus.Fields{
-		"timestampAfterBidUpdate":    time.Now().UTC().UnixMilli(),
-		"wasBidSavedInRedis":         updateBidResult.WasBidSaved,
-		"wasTopBidUpdated":           updateBidResult.WasTopBidUpdated,
-		"topBidValue":                updateBidResult.TopBidValue,
-		"prevTopBidValue":            updateBidResult.PrevTopBidValue,
-		"profileRedisSavePayloadUs":  updateBidResult.TimeSavePayload.Microseconds(),
-		"profileRedisUpdateTopBidUs": updateBidResult.TimeUpdateTopBid.Microseconds(),
-		"profileRedisUpdateFloorUs":  updateBidResult.TimeUpdateFloor.Microseconds(),
+		"timestampAfterBidUpdate": time.Now().UTC().UnixMilli(),
+		"wasBidSavedInRedis":      updateBidResult.WasBidSaved,
+		"wasTopBidUpdated":        updateBidResult.WasTopBidUpdated,
+		"topBidValue":             updateBidResult.TopBidValue,
+		"prevTopBidValue":         updateBidResult.PrevTopBidValue,
+		"profileRedisPrepUs":      updateBidResult.TimePrep.Microseconds(),
+		"profileRedisUpdateUs":    updateBidResult.TimeRedisUpdate.Microseconds(),
 	})
 
 	if updateBidResult.WasBidSaved {

@@ -18,7 +18,7 @@ import (
 	"github.com/flashbots/mev-boost-relay/common"
 	"github.com/flashbots/mev-boost-relay/database"
 	"github.com/flashbots/mev-boost-relay/datastore"
-	"github.com/go-redis/redis/v9"
+	"github.com/redis/go-redis/v9"
 	"github.com/gorilla/mux"
 	"github.com/sirupsen/logrus"
 	"github.com/tdewolff/minify"
