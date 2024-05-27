@@ -36,7 +36,7 @@ import (
 	"github.com/flashbots/mev-boost-relay/database"
 	"github.com/flashbots/mev-boost-relay/datastore"
 	"github.com/flashbots/mev-boost-relay/metrics"
-	"github.com/go-redis/redis/v9"
+	"github.com/redis/go-redis/v9"
 	"github.com/gorilla/mux"
 	"github.com/holiman/uint256"
 	"github.com/pkg/errors"
@@ -2356,14 +2356,13 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 
 	// Add fields to logs
 	log = log.WithFields(logrus.Fields{
-		"timestampAfterBidUpdate":    time.Now().UTC().UnixMilli(),
-		"wasBidSavedInRedis":         updateBidResult.WasBidSaved,
-		"wasTopBidUpdated":           updateBidResult.WasTopBidUpdated,
-		"topBidValue":                updateBidResult.TopBidValue,
-		"prevTopBidValue":            updateBidResult.PrevTopBidValue,
-		"profileRedisSavePayloadUs":  updateBidResult.TimeSavePayload.Microseconds(),
-		"profileRedisUpdateTopBidUs": updateBidResult.TimeUpdateTopBid.Microseconds(),
-		"profileRedisUpdateFloorUs":  updateBidResult.TimeUpdateFloor.Microseconds(),
+		"timestampAfterBidUpdate": time.Now().UTC().UnixMilli(),
+		"wasBidSavedInRedis":      updateBidResult.WasBidSaved,
+		"wasTopBidUpdated":        updateBidResult.WasTopBidUpdated,
+		"topBidValue":             updateBidResult.TopBidValue,
+		"prevTopBidValue":         updateBidResult.PrevTopBidValue,
+		"profileRedisPrepUs":      updateBidResult.TimePrep.Microseconds(),
+		"profileRedisUpdateUs":    updateBidResult.TimeRedisUpdate.Microseconds(),
 	})
 
 	if updateBidResult.WasBidSaved {
@@ -2385,9 +2384,6 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 	nextTime = time.Now().UTC()
 	pf.RedisUpdate = uint64(nextTime.Sub(prevTime).Microseconds())
 	pf.WasBidSaved = updateBidResult.WasBidSaved
-	pf.RedisSavePayload = uint64(updateBidResult.TimeSavePayload.Microseconds())
-	pf.RedisUpdateTopBid = uint64(updateBidResult.TimeUpdateTopBid.Microseconds())
-	pf.RedisUpdateFloor = uint64(updateBidResult.TimeUpdateFloor.Microseconds())
 	pf.Total = uint64(nextTime.Sub(receivedAt).Microseconds())
 
 	// All done, log with profiling information
@@ -2437,27 +2433,6 @@ func (api *RelayAPI) saveBlockSubmissionMetrics(pf common.Profile, receivedTime 
 			context.Background(),
 			float64(pf.RedisUpdate)/1000,
 			otelapi.WithAttributes(attribute.Bool("wasBidSaved", pf.WasBidSaved)),
-		)
-	}
-
-	if pf.RedisSavePayload > 0 {
-		metrics.SubmitNewBlockRedisPayloadLatencyHistogram.Record(
-			context.Background(),
-			float64(pf.RedisSavePayload)/1000,
-		)
-	}
-
-	if pf.RedisUpdateTopBid > 0 {
-		metrics.SubmitNewBlockRedisTopBidLatencyHistogram.Record(
-			context.Background(),
-			float64(pf.RedisUpdateTopBid)/1000,
-		)
-	}
-
-	if pf.RedisUpdateFloor > 0 {
-		metrics.SubmitNewBlockRedisFloorLatencyHistogram.Record(
-			context.Background(),
-			float64(pf.RedisUpdateFloor)/1000,
 		)
 	}
 

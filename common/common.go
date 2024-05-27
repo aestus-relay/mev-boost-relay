@@ -49,11 +49,6 @@ type Profile struct {
 	RedisUpdate uint64
 	Total       uint64
 
-	// Redis profiling
-	RedisSavePayload  uint64
-	RedisUpdateTopBid uint64
-	RedisUpdateFloor  uint64
-
 	// Attributes
 	IsGzip            bool
 	ContentType       string

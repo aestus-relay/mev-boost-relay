@@ -30,10 +30,6 @@ var (
 	SubmitNewBlockSimulationLatencyHistogram otelapi.Float64Histogram
 	SubmitNewBlockRedisLatencyHistogram      otelapi.Float64Histogram
 
-	SubmitNewBlockRedisPayloadLatencyHistogram otelapi.Float64Histogram
-	SubmitNewBlockRedisTopBidLatencyHistogram  otelapi.Float64Histogram
-	SubmitNewBlockRedisFloorLatencyHistogram   otelapi.Float64Histogram
-
 	BuilderDemotionCount otelapi.Int64Counter
 
 	// latencyBoundariesMs is the set of buckets of exponentially growing
@@ -62,9 +58,6 @@ func Setup(ctx context.Context) error {
 		setupSubmitNewBlockPrechecksLatency,
 		setupSubmitNewBlockSimulationLatency,
 		setupSubmitNewBlockRedisLatency,
-		setupSubmitNewBlockRedisPayloadLatency,
-		setupSubmitNewBlockRedisTopBidLatency,
-		setupSubmitNewBlockRedisFloorLatency,
 		setupBuilderDemotionCount,
 	} {
 		if err := setup(ctx); err != nil {
@@ -220,48 +213,6 @@ func setupSubmitNewBlockRedisLatency(_ context.Context) error {
 		latencyBoundariesMs,
 	)
 	SubmitNewBlockRedisLatencyHistogram = latency
-	if err != nil {
-		return err
-	}
-	return nil
-}
-
-func setupSubmitNewBlockRedisPayloadLatency(_ context.Context) error {
-	latency, err := meter.Float64Histogram(
-		"submit_new_block_redis_payload_latency",
-		otelapi.WithDescription("statistics on the redis save payload duration during redis updates of submitNewBlock requests"),
-		otelapi.WithUnit("ms"),
-		latencyBoundariesMs,
-	)
-	SubmitNewBlockRedisPayloadLatencyHistogram = latency
-	if err != nil {
-		return err
-	}
-	return nil
-}
-
-func setupSubmitNewBlockRedisTopBidLatency(_ context.Context) error {
-	latency, err := meter.Float64Histogram(
-		"submit_new_block_redis_top_bid_latency",
-		otelapi.WithDescription("statistics on the redis update top bid duration during redis updates of submitNewBlock requests"),
-		otelapi.WithUnit("ms"),
-		latencyBoundariesMs,
-	)
-	SubmitNewBlockRedisTopBidLatencyHistogram = latency
-	if err != nil {
-		return err
-	}
-	return nil
-}
-
-func setupSubmitNewBlockRedisFloorLatency(_ context.Context) error {
-	latency, err := meter.Float64Histogram(
-		"submit_new_block_redis_floor_latency",
-		otelapi.WithDescription("statistics on the redis update floor bid duration during redis updates of submitNewBlock requests"),
-		otelapi.WithUnit("ms"),
-		latencyBoundariesMs,
-	)
-	SubmitNewBlockRedisFloorLatencyHistogram = latency
 	if err != nil {
 		return err
 	}
