@@ -669,7 +669,7 @@ func (r *RedisCache) updateTopBid(ctx context.Context, pipeliner redis.Pipeliner
 	}
 
 	// Execute redis function call
-	c := pipeliner.FCall(ctx, LuaFunctionUpdateTopBid, keys, args)
+	c := pipeliner.FCall(ctx, LuaFunctionUpdateTopBid, keys, args...)
 	_, err = pipeliner.Exec(ctx)
 	if err != nil {
 		return state, err
