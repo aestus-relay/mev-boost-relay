@@ -66,11 +66,11 @@ local function updateTopBid(keys, args)
 
    -- Publish the new top bid if it changed
    if newTopValue ~= prevTopValue then
-      local topGetHeaderResp = redis.call('GET', keyCacheGetHeaderResponse)
+      local topGetHeaderResp = redis.call('GET', keys[4])
       local topBidUpdate = formatTopBidUpdateMsg(topGetHeaderResp, args[4])
       redis.call('PUBLISH', args[3], topBidUpdate)
    end
-   return
+   return true
 end
 
 --[[
@@ -114,7 +114,7 @@ local function saveBidAndUpdateTopBid(keys, args)
    -- Abort if non-cancellation bid is lower than floor bid
    if args[8] == '0' and tonumber(args[2]) < tonumber(floorBidValue) then
       redis.call('PUBLISH', 'lualog', 'Bid ' .. args[2] .. ' is lower than floor bid ' .. floorBidValue)
-      return {err = 'Bid is lower than floor bid'}
+      return state
    end
 
    -- Save the execution payload
