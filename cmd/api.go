@@ -57,6 +57,7 @@ func init() {
 	apiCmd.Flags().StringSliceVar(&beaconNodePublishURIs, "beacon-publish-uris", defaultBeaconPublishURIs, "beacon publish endpoints")
 	apiCmd.Flags().StringVar(&redisURI, "redis-uri", defaultRedisURI, "redis uri")
 	apiCmd.Flags().StringVar(&redisReadonlyURI, "redis-readonly-uri", defaultRedisReadonlyURI, "redis readonly uri")
+	apiCmd.Flags().StringVar(&bidEngineURI, "bidengine-uri", defaultBidEngineURI, "bid engine (redis) uri")
 	apiCmd.Flags().StringVar(&postgresDSN, "db", defaultPostgresDSN, "PostgreSQL DSN")
 	apiCmd.Flags().StringSliceVar(&memcachedURIs, "memcached-uris", defaultMemcachedURIs,
 		"Enable memcached, typically used as secondary backup to Redis for redundancy")
@@ -122,9 +123,9 @@ var apiCmd = &cobra.Command{
 		if redisReadonlyURI == "" {
 			log.Infof("Connecting to Redis at %s ...", redisURI)
 		} else {
-			log.Infof("Connecting to Redis at %s / readonly: %s ...", redisURI, redisReadonlyURI)
+			log.Infof("Connecting to Redis at %s / readonly: %s / bidengine %s ...", redisURI, redisReadonlyURI, bidEngineURI)
 		}
-		redis, err := datastore.NewRedisCache(networkInfo.Name, redisURI, redisReadonlyURI)
+		redis, err := datastore.NewRedisCache(networkInfo.Name, redisURI, redisReadonlyURI, bidEngineURI)
 		if err != nil {
 			log.WithError(err).Fatalf("Failed to connect to Redis at %s", redisURI)
 		}
