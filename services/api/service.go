@@ -23,6 +23,7 @@ import (
 	"github.com/NYTimes/gziphandler"
 	builderApi "github.com/attestantio/go-builder-client/api"
 	builderApiV1 "github.com/attestantio/go-builder-client/api/v1"
+	builderSpec "github.com/attestantio/go-builder-client/spec"
 	"github.com/attestantio/go-eth2-client/spec"
 	"github.com/attestantio/go-eth2-client/spec/phase0"
 	"github.com/buger/jsonparser"
@@ -1900,7 +1901,8 @@ func (api *RelayAPI) checkBuilderEntry(w http.ResponseWriter, log *logrus.Entry,
 
 type bidFloorOpts struct {
 	w                    http.ResponseWriter
-	tx                   redis.Pipeliner
+	tx                   datastore.RedisPipeliner
+	txBidEngine          datastore.BidEnginePipeliner
 	log                  *logrus.Entry
 	cancellationsEnabled bool
 	simResultC           chan *blockSimResult
@@ -1919,7 +1921,7 @@ func (api *RelayAPI) checkFloorBidValue(opts bidFloorOpts) (*big.Int, bool) {
 	}
 
 	// Grab floor bid value
-	floorBidValue, err := api.redis.GetFloorBidValue(context.Background(), opts.tx, opts.submission.BidTrace.Slot, opts.submission.BidTrace.ParentHash.String(), opts.submission.BidTrace.ProposerPubkey.String())
+	floorBidValue, err := api.redis.GetFloorBidValue(context.Background(), opts.txBidEngine, opts.submission.BidTrace.Slot, opts.submission.BidTrace.ParentHash.String(), opts.submission.BidTrace.ProposerPubkey.String())
 	if err != nil {
 		opts.log.WithError(err).Error("failed to get floor bid value from redis")
 	} else {
@@ -1934,7 +1936,7 @@ func (api *RelayAPI) checkFloorBidValue(opts bidFloorOpts) (*big.Int, bool) {
 	if opts.cancellationsEnabled && isBidBelowFloor { // with cancellations: if below floor -> delete previous bid
 		opts.simResultC <- &blockSimResult{false, nil, false, nil, nil}
 		opts.log.Info("submission below floor bid value, with cancellation")
-		err := api.redis.DelBuilderBid(context.Background(), opts.tx, opts.submission.BidTrace.Slot, opts.submission.BidTrace.ParentHash.String(), opts.submission.BidTrace.ProposerPubkey.String(), opts.submission.BidTrace.BuilderPubkey.String())
+		err := api.redis.DelBuilderBid(context.Background(), opts.txBidEngine, opts.submission.BidTrace.Slot, opts.submission.BidTrace.ParentHash.String(), opts.submission.BidTrace.ProposerPubkey.String(), opts.submission.BidTrace.BuilderPubkey.String())
 		if err != nil {
 			opts.log.WithError(err).Error("failed processing cancellable bid below floor")
 			api.RespondError(opts.w, http.StatusInternalServerError, "failed processing cancellable bid below floor")
@@ -1951,37 +1953,27 @@ func (api *RelayAPI) checkFloorBidValue(opts bidFloorOpts) (*big.Int, bool) {
 	return floorBidValue, true
 }
 
-type redisUpdateBidOpts struct {
-	w                    http.ResponseWriter
-	tx                   redis.Pipeliner
-	log                  *logrus.Entry
-	cancellationsEnabled bool
-	receivedAt           time.Time
-	floorBidValue        *big.Int
-	payload              *common.VersionedSubmitBlockRequest
-}
-
-func (api *RelayAPI) updateRedisBid(opts redisUpdateBidOpts) (*datastore.SaveBidAndUpdateTopBidResponse, *builderApi.VersionedSubmitBlindedBlockResponse, bool) {
+func (api *RelayAPI) buildAndSaveResponses(pipeliner datastore.RedisPipeliner, payload *common.VersionedSubmitBlockRequest, log *logrus.Entry, w http.ResponseWriter, redisResultChan chan error) (*builderSpec.VersionedSignedBuilderBid, *builderApi.VersionedSubmitBlindedBlockResponse, *common.BidTraceV2WithBlobFields, error) {
 	// Prepare the response data
-	getHeaderResponse, err := common.BuildGetHeaderResponse(opts.payload, api.blsSk, api.publicKey, api.opts.EthNetDetails.DomainBuilder)
+	getHeaderResponse, err := common.BuildGetHeaderResponse(payload, api.blsSk, api.publicKey, api.opts.EthNetDetails.DomainBuilder)
 	if err != nil {
-		opts.log.WithError(err).Error("could not sign builder bid")
-		api.RespondError(opts.w, http.StatusBadRequest, err.Error())
-		return nil, nil, false
+		log.WithError(err).Error("could not sign builder bid")
+		api.RespondError(w, http.StatusBadRequest, err.Error())
+		return nil, nil, nil, err
 	}
 
-	getPayloadResponse, err := common.BuildGetPayloadResponse(opts.payload)
+	getPayloadResponse, err := common.BuildGetPayloadResponse(payload)
 	if err != nil {
-		opts.log.WithError(err).Error("could not build getPayload response")
-		api.RespondError(opts.w, http.StatusBadRequest, err.Error())
-		return nil, nil, false
+		log.WithError(err).Error("could not build getPayload response")
+		api.RespondError(w, http.StatusBadRequest, err.Error())
+		return nil, nil, nil, err
 	}
 
-	submission, err := common.GetBlockSubmissionInfo(opts.payload)
+	submission, err := common.GetBlockSubmissionInfo(payload)
 	if err != nil {
-		opts.log.WithError(err).Error("could not get block submission info")
-		api.RespondError(opts.w, http.StatusBadRequest, err.Error())
-		return nil, nil, false
+		log.WithError(err).Error("could not get block submission info")
+		api.RespondError(w, http.StatusBadRequest, err.Error())
+		return nil, nil, nil, err
 	}
 
 	bidTrace := common.BidTraceV2WithBlobFields{
@@ -1993,16 +1985,24 @@ func (api *RelayAPI) updateRedisBid(opts redisUpdateBidOpts) (*datastore.SaveBid
 		ExcessBlobGas: submission.ExcessBlobGas,
 	}
 
-	//
-	// Save to Redis
-	//
-	updateBidResult, err := api.redis.SaveBidAndUpdateTopBid(context.Background(), opts.tx, &bidTrace, opts.payload, getPayloadResponse, getHeaderResponse, opts.receivedAt, opts.cancellationsEnabled, opts.floorBidValue)
-	if err != nil {
-		opts.log.WithError(err).Error("could not save bid and update top bids")
-		api.RespondError(opts.w, http.StatusInternalServerError, "failed saving and updating bid")
-		return nil, nil, false
+	// Save payload response and bid trace to redis and memcached
+	// Do not block on this, start simulation ASAP and check response later
+	go func() {
+		redisErr := api.redis.SaveResponses(context.Background(), pipeliner, payload, submission, getPayloadResponse, &bidTrace)
+		redisResultChan <- redisErr
+	}()
+
+	// Memcached is less critical, can also be done in background and errors need only be logged
+	if api.memcached != nil {
+		go func() {
+			mcdErr := api.memcached.SaveExecutionPayload(submission.BidTrace.Slot, submission.BidTrace.ProposerPubkey.String(), submission.BidTrace.BlockHash.String(), getPayloadResponse)
+			if mcdErr != nil {
+				log.WithError(mcdErr).Error("failed saving execution payload in memcached")
+			}
+		}()
 	}
-	return &updateBidResult, getPayloadResponse, true
+
+	return getHeaderResponse, getPayloadResponse, &bidTrace, err
 }
 
 func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Request) {
@@ -2186,23 +2186,31 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 		return
 	}
 
-	log = log.WithField("timestampBeforeCheckingFloorBid", time.Now().UTC().UnixMilli())
-
-	// Create the redis pipeline tx
+	// Create the redis pipeline txs
 	tx := api.redis.NewTxPipeline()
+	txBidEngine := api.redis.NewTxBidEnginePipeline()
 
 	// channel to send simulation result to the deferred function
 	simResultC := make(chan *blockSimResult, 1)
 	var eligibleAt time.Time // will be set once the bid is ready
 
+	// Log sub-timings for the Precheck phase
+	nextPrecheckTime := time.Now().UTC()
+	log = log.WithField("profilePrechecksBlockUs", uint64(nextPrecheckTime.Sub(prevTime).Microseconds()))
+	prevPrecheckTime := nextPrecheckTime
+
+	log = log.WithField("timestampBeforeCheckingFloorBid", time.Now().UTC().UnixMilli())
+
 	bfOpts := bidFloorOpts{
 		w:                    w,
 		tx:                   tx,
+		txBidEngine:          txBidEngine,
 		log:                  log,
 		cancellationsEnabled: isCancellationEnabled,
 		simResultC:           simResultC,
 		submission:           submission,
 	}
+
 	floorBidValue, ok := api.checkFloorBidValue(bfOpts)
 	if !ok {
 		return
@@ -2210,6 +2218,37 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 
 	pf.AboveFloorBid = true
 	log = log.WithField("timestampAfterCheckingFloorBid", time.Now().UTC().UnixMilli())
+
+	// Get the latest top bid value from Redis
+	bidIsTopBid := false
+	topBidValue, err := api.redis.GetTopBidValue(context.Background(), txBidEngine, submission.BidTrace.Slot, submission.BidTrace.ParentHash.String(), submission.BidTrace.ProposerPubkey.String())
+	if err != nil {
+		log.WithError(err).Error("failed to get top bid value from redis")
+	} else {
+		bidIsTopBid = submission.BidTrace.Value.ToBig().Cmp(topBidValue) == 1
+		log = log.WithFields(logrus.Fields{
+			"topBidValue":    topBidValue.String(),
+			"newBidIsTopBid": bidIsTopBid,
+		})
+	}
+
+	nextPrecheckTime = time.Now().UTC()
+	log = log.WithField("profilePrechecksTopFloorUs", uint64(nextPrecheckTime.Sub(prevPrecheckTime).Microseconds()))
+	prevPrecheckTime = nextPrecheckTime
+
+	log = log.WithField("timestampAfterCheckingTopBid", time.Now().UTC().UnixMilli())
+
+	// Save payload and bid trace to redis and memcached now for getPayload eligibility
+	responseSaveC := make(chan error, 1)
+	getHeaderResponse, _, _, err := api.buildAndSaveResponses(tx, payload, log, w, responseSaveC)
+	if err != nil {
+		log.WithError(err).Error("failed to build responses from bid")
+		api.RespondError(w, http.StatusInternalServerError, "failed to build responses from bid")
+		return
+	}
+
+	nextPrecheckTime = time.Now().UTC()
+	log = log.WithField("profilePrechecksResponsesUs", uint64(nextPrecheckTime.Sub(prevPrecheckTime).Microseconds()))
 
 	// Deferred saving of the builder submission to database (whenever this function ends)
 	defer func() {
@@ -2240,23 +2279,6 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 	// ---------------------------------
 	// THE BID WILL BE SIMULATED SHORTLY
 	// ---------------------------------
-
-	log = log.WithField("timestampBeforeCheckingTopBid", time.Now().UTC().UnixMilli())
-
-	// Get the latest top bid value from Redis
-	bidIsTopBid := false
-	topBidValue, err := api.redis.GetTopBidValue(context.Background(), tx, submission.BidTrace.Slot, submission.BidTrace.ParentHash.String(), submission.BidTrace.ProposerPubkey.String())
-	if err != nil {
-		log.WithError(err).Error("failed to get top bid value from redis")
-	} else {
-		bidIsTopBid = submission.BidTrace.Value.ToBig().Cmp(topBidValue) == 1
-		log = log.WithFields(logrus.Fields{
-			"topBidValue":    topBidValue.String(),
-			"newBidIsTopBid": bidIsTopBid,
-		})
-	}
-
-	log = log.WithField("timestampAfterCheckingTopBid", time.Now().UTC().UnixMilli())
 
 	nextTime = time.Now().UTC()
 	pf.Prechecks = uint64(nextTime.Sub(prevTime).Microseconds())
@@ -2330,7 +2352,7 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 		// latency will make it impossible to predict which arrives first. Thus a high bid could unintentionally be overwritten by a low bid that happened
 		// to arrive a few microseconds later. If builders are submitting blocks at a frequency where they cannot reliably predict which bid will arrive at
 		// the relay first, they should instead use multiple pubkeys to avoid uninitentionally overwriting their own bids.
-		latestPayloadReceivedAt, err := api.redis.GetBuilderLatestPayloadReceivedAt(context.Background(), tx, submission.BidTrace.Slot, submission.BidTrace.BuilderPubkey.String(), submission.BidTrace.ParentHash.String(), submission.BidTrace.ProposerPubkey.String())
+		latestPayloadReceivedAt, err := api.redis.GetBuilderLatestPayloadReceivedAt(context.Background(), txBidEngine, submission.BidTrace.Slot, submission.BidTrace.BuilderPubkey.String(), submission.BidTrace.ParentHash.String(), submission.BidTrace.ProposerPubkey.String())
 		if err != nil {
 			log.WithError(err).Error("failed getting latest payload receivedAt from redis")
 		} else if receivedAt.UnixMilli() < latestPayloadReceivedAt {
@@ -2340,17 +2362,25 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 		}
 	}
 
-	redisOpts := redisUpdateBidOpts{
-		w:                    w,
-		tx:                   tx,
-		log:                  log,
-		cancellationsEnabled: isCancellationEnabled,
-		receivedAt:           receivedAt,
-		floorBidValue:        floorBidValue,
-		payload:              payload,
+	// Before updating the bid in redis, ensure payload response was saved properly
+	select {
+	case responseSaveErr := <-responseSaveC:
+		if responseSaveErr != nil {
+			log.WithError(responseSaveErr).Error("failing saving responses to redis")
+			api.RespondError(w, http.StatusInternalServerError, "failed to save bid responses")
+			return
+		}
+	case <-time.After(1 * time.Second):
+		log.Error("timeout saving response to redis")
+		api.RespondError(w, http.StatusGatewayTimeout, "timeout saving responses to redis")
+		return
 	}
-	updateBidResult, getPayloadResponse, ok := api.updateRedisBid(redisOpts)
-	if !ok {
+
+	// Perform the top bid update
+	updateBidResult, err := api.redis.ProcessBidAndUpdateTopBid(context.Background(), txBidEngine, payload, getHeaderResponse, receivedAt, isCancellationEnabled, floorBidValue)
+	if err != nil {
+		log.WithError(err).Error("could not process bid and update top bid")
+		api.RespondError(w, http.StatusInternalServerError, "failed updating top bid")
 		return
 	}
 
@@ -2369,16 +2399,6 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 		// Bid is eligible to win the auction
 		eligibleAt = time.Now().UTC()
 		log = log.WithField("timestampEligibleAt", eligibleAt.UnixMilli())
-
-		// Save to memcache in the background
-		if api.memcached != nil {
-			go func() {
-				err = api.memcached.SaveExecutionPayload(submission.BidTrace.Slot, submission.BidTrace.ProposerPubkey.String(), submission.BidTrace.BlockHash.String(), getPayloadResponse)
-				if err != nil {
-					log.WithError(err).Error("failed saving execution payload in memcached")
-				}
-			}()
-		}
 	}
 
 	nextTime = time.Now().UTC()
@@ -2388,11 +2408,12 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 
 	// All done, log with profiling information
 	log.WithFields(logrus.Fields{
-		"profileDecodeUs":    pf.Decode,
-		"profilePrechecksUs": pf.Prechecks,
-		"profileSimUs":       pf.Simulation,
-		"profileRedisUs":     pf.RedisUpdate,
-		"profileTotalUs":     pf.Total,
+		"profilePayloadLoadUs": pf.PayloadLoad,
+		"profileDecodeUs":      pf.Decode,
+		"profilePrechecksUs":   pf.Prechecks,
+		"profileSimUs":         pf.Simulation,
+		"profileRedisUs":       pf.RedisUpdate,
+		"profileTotalUs":       pf.Total,
 	}).Info("received block from builder")
 	w.WriteHeader(http.StatusOK)
 }
