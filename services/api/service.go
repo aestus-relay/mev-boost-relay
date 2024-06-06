@@ -1936,7 +1936,7 @@ func (api *RelayAPI) checkFloorBidValue(opts bidFloorOpts) (*big.Int, bool) {
 	if opts.cancellationsEnabled && isBidBelowFloor { // with cancellations: if below floor -> delete previous bid
 		opts.simResultC <- &blockSimResult{false, nil, false, nil, nil}
 		opts.log.Info("submission below floor bid value, with cancellation")
-		err := api.redis.DelBuilderBid(context.Background(), opts.txBidEngine, opts.submission.BidTrace.Slot, opts.submission.BidTrace.ParentHash.String(), opts.submission.BidTrace.ProposerPubkey.String(), opts.submission.BidTrace.BuilderPubkey.String())
+		err := api.redis.DelBuilderBid(context.Background(), opts.submission.BidTrace.Slot, opts.submission.BidTrace.ParentHash.String(), opts.submission.BidTrace.ProposerPubkey.String(), opts.submission.BidTrace.BuilderPubkey.String())
 		if err != nil {
 			opts.log.WithError(err).Error("failed processing cancellable bid below floor")
 			api.RespondError(opts.w, http.StatusInternalServerError, "failed processing cancellable bid below floor")
@@ -2187,8 +2187,10 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 	}
 
 	// Create the redis pipeline txs
+	// The bid engine tx is only used for read-only operations
+	// All writes are handled directly or with their own tx
 	tx := api.redis.NewTxPipeline()
-	txBidEngine := api.redis.NewTxBidEnginePipeline()
+	txBidEngine := api.redis.NewTxBidEngineROPipeline()
 
 	// channel to send simulation result to the deferred function
 	simResultC := make(chan *blockSimResult, 1)
@@ -2377,7 +2379,7 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 	}
 
 	// Perform the top bid update
-	updateBidResult, err := api.redis.ProcessBidAndUpdateTopBid(context.Background(), txBidEngine, payload, getHeaderResponse, receivedAt, isCancellationEnabled, floorBidValue)
+	updateBidResult, err := api.redis.ProcessBidAndUpdateTopBid(context.Background(), payload, getHeaderResponse, receivedAt, isCancellationEnabled, floorBidValue)
 	if err != nil {
 		log.WithError(err).Error("could not process bid and update top bid")
 		api.RespondError(w, http.StatusInternalServerError, "failed updating top bid")

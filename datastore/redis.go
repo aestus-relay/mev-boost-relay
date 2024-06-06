@@ -98,9 +98,10 @@ func connectRedis(redisURI string) (*redis.Client, error) {
 }
 
 type RedisCache struct {
-	client          *redis.Client
-	readonlyClient  *redis.Client
-	bidEngineClient *redis.Client
+	client            *redis.Client
+	readonlyClient    *redis.Client
+	bidEngineClient   *redis.Client
+	bidEngineROClient *redis.Client
 
 	// prefixes (keys generated with a function)
 	prefixGetHeaderResponse           string
@@ -132,7 +133,7 @@ type RedisCache struct {
 	currentSlot uint64
 }
 
-func NewRedisCache(prefix, redisURI, readonlyURI, bidEngineURI string) (*RedisCache, error) {
+func NewRedisCache(prefix, redisURI, readonlyURI, bidEngineURI, bidEngineROURI string) (*RedisCache, error) {
 	client, err := connectRedis(redisURI)
 	if err != nil {
 		return nil, err
@@ -146,21 +147,33 @@ func NewRedisCache(prefix, redisURI, readonlyURI, bidEngineURI string) (*RedisCa
 		}
 	}
 
-	bidEngineClient, err := connectRedis(bidEngineURI)
-	if err != nil {
-		return nil, err
+	var bidEngineClient *redis.Client
+	if bidEngineURI != "" {
+		bidEngineClient, err = connectRedis(bidEngineURI)
+		if err != nil {
+			return nil, err
+		}
+
+		// Load function library
+		err = bidEngineClient.FunctionLoadReplace(context.Background(), TopBidLuaLibrary).Err()
+		if err != nil {
+			return nil, err
+		}
 	}
 
-	// Load function library
-	err = bidEngineClient.FunctionLoadReplace(context.Background(), TopBidLuaLibrary).Err()
-	if err != nil {
-		return nil, err
+	var bidEngineROClient *redis.Client
+	if bidEngineROURI != "" {
+		bidEngineROClient, err = connectRedis(bidEngineROURI)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	return &RedisCache{
 		client:         client,
 		readonlyClient: roClient,
 		bidEngineClient: bidEngineClient,
+		bidEngineROClient: bidEngineROClient,
 
 		prefixGetHeaderResponse:    fmt.Sprintf("%s/%s:cache-gethead-response", bidEnginePrefix, prefix),
 		prefixExecPayloadCapella:   fmt.Sprintf("%s/%s:cache-execpayload-capella", redisPrefix, prefix),
@@ -572,7 +585,7 @@ type ProcessBidAndUpdateTopBidResponse struct {
 	TimeRedisUpdate  time.Duration
 }
 
-func (r *RedisCache) ProcessBidAndUpdateTopBid(ctx context.Context, pipeliner BidEnginePipeliner, payload *common.VersionedSubmitBlockRequest, getHeaderResponse *builderSpec.VersionedSignedBuilderBid, reqReceivedAt time.Time, isCancellationEnabled bool, floorValue *big.Int) (state ProcessBidAndUpdateTopBidResponse, err error) {
+func (r *RedisCache) ProcessBidAndUpdateTopBid(ctx context.Context, payload *common.VersionedSubmitBlockRequest, getHeaderResponse *builderSpec.VersionedSignedBuilderBid, reqReceivedAt time.Time, isCancellationEnabled bool, floorValue *big.Int) (state ProcessBidAndUpdateTopBidResponse, err error) {
 	var prevTime, nextTime time.Time
 	prevTime = time.Now()
 
@@ -621,12 +634,7 @@ func (r *RedisCache) ProcessBidAndUpdateTopBid(ctx context.Context, pipeliner Bi
 	prevTime = nextTime
 
 	// Execute redis function call
-	c := pipeliner.FCall(ctx, LuaFunctionProcessBidAndUpdateTopBid, keys, args...)
-	_, err = pipeliner.Exec(ctx)
-	if err != nil {
-		return state, err
-	}
-	result, err := c.Result()
+	result, err := r.bidEngineClient.FCall(ctx, LuaFunctionProcessBidAndUpdateTopBid, keys, args...).Result()
 	if err != nil {
 		return state, err
 	}
@@ -737,7 +745,10 @@ func (r *RedisCache) GetBuilderLatestValue(slot uint64, parentHash, proposerPubk
 }
 
 // DelBuilderBid removes a builders most recent bid
-func (r *RedisCache) DelBuilderBid(ctx context.Context, pipeliner BidEnginePipeliner, slot uint64, parentHash, proposerPubkey, builderPubkey string) (err error) {
+func (r *RedisCache) DelBuilderBid(ctx context.Context, slot uint64, parentHash, proposerPubkey, builderPubkey string) (err error) {
+	// Create a tx pipeline for these operations
+	pipeliner := r.NewTxBidEnginePipeline()
+
 	// delete the value
 	keyLatestValue := r.keyBlockBuilderLatestBidsValue(slot, parentHash, proposerPubkey)
 	err = pipeliner.HDel(ctx, keyLatestValue, builderPubkey).Err()
@@ -753,6 +764,7 @@ func (r *RedisCache) DelBuilderBid(ctx context.Context, pipeliner BidEnginePipel
 	}
 
 	// update bids now to compute current top bid
+	// Executes the pipeline
 	state := ProcessBidAndUpdateTopBidResponse{} //nolint:exhaustruct
 	_, err = r.updateTopBid(ctx, pipeliner, state, nil, slot, parentHash, proposerPubkey, nil)
 	return err
@@ -868,4 +880,8 @@ func (r *RedisCache) NewTxPipeline() RedisPipeliner { //nolint:ireturn
 
 func (r *RedisCache) NewTxBidEnginePipeline() BidEnginePipeliner { //nolint:ireturn
 	return &bidEnginePipelinerImpl{r.bidEngineClient.TxPipeline()}
+}
+
+func (r *RedisCache) NewTxBidEngineROPipeline() BidEnginePipeliner { //nolint:ireturn
+	return &bidEnginePipelinerImpl{r.bidEngineROClient.TxPipeline()}
 }
