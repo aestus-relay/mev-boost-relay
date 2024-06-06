@@ -58,6 +58,7 @@ func init() {
 	apiCmd.Flags().StringVar(&redisURI, "redis-uri", defaultRedisURI, "redis uri")
 	apiCmd.Flags().StringVar(&redisReadonlyURI, "redis-readonly-uri", defaultRedisReadonlyURI, "redis readonly uri")
 	apiCmd.Flags().StringVar(&bidEngineURI, "bidengine-uri", defaultBidEngineURI, "bid engine (redis) uri")
+	apiCmd.Flags().StringVar(&bidEngineROURI, "bidengine-ro-uri", defaultBidEngineURI, "bid engine readonly (redis) uri")
 	apiCmd.Flags().StringVar(&postgresDSN, "db", defaultPostgresDSN, "PostgreSQL DSN")
 	apiCmd.Flags().StringSliceVar(&memcachedURIs, "memcached-uris", defaultMemcachedURIs,
 		"Enable memcached, typically used as secondary backup to Redis for redundancy")
@@ -123,9 +124,9 @@ var apiCmd = &cobra.Command{
 		if redisReadonlyURI == "" {
 			log.Infof("Connecting to Redis at %s ...", redisURI)
 		} else {
-			log.Infof("Connecting to Redis at %s / readonly: %s / bidengine %s ...", redisURI, redisReadonlyURI, bidEngineURI)
+			log.Infof("Connecting to Redis at %s / readonly: %s / bidengine %s / bidengine_ro %s ...", redisURI, redisReadonlyURI, bidEngineURI, bidEngineROURI)
 		}
-		redis, err := datastore.NewRedisCache(networkInfo.Name, redisURI, redisReadonlyURI, bidEngineURI)
+		redis, err := datastore.NewRedisCache(networkInfo.Name, redisURI, redisReadonlyURI, bidEngineURI, bidEngineROURI)
 		if err != nil {
 			log.WithError(err).Fatalf("Failed to connect to Redis at %s", redisURI)
 		}

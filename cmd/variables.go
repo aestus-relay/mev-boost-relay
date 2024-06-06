@@ -13,6 +13,7 @@ var (
 	defaultRedisURI          = common.GetEnv("REDIS_URI", "localhost:6379")
 	defaultRedisReadonlyURI  = common.GetEnv("REDIS_READONLY_URI", "")
 	defaultBidEngineURI      = common.GetEnv("REDIS_BIDENGINE_URI", "")
+	defaultBidEngineROURI    = common.GetEnv("REDIS_BIDENGINE_RO_URI", "")
 	defaultPostgresDSN       = common.GetEnv("POSTGRES_DSN", "")
 	defaultMemcachedURIs     = common.GetSliceEnv("MEMCACHED_URIS", nil)
 	defaultLogJSON           = os.Getenv("LOG_JSON") != ""
@@ -24,6 +25,7 @@ var (
 	redisURI              string
 	redisReadonlyURI      string
 	bidEngineURI          string
+	bidEngineROURI        string
 	postgresDSN           string
 	memcachedURIs         []string
 

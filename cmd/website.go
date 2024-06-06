@@ -38,7 +38,6 @@ func init() {
 	websiteCmd.Flags().StringVar(&websiteListenAddr, "listen-addr", websiteDefaultListenAddr, "listen address for webserver")
 	websiteCmd.Flags().StringVar(&redisURI, "redis-uri", defaultRedisURI, "redis uri")
 	websiteCmd.Flags().StringVar(&redisReadonlyURI, "redis-readonly-uri", defaultRedisReadonlyURI, "redis readonly uri")
-	websiteCmd.Flags().StringVar(&bidEngineURI, "bidengine-uri", defaultBidEngineURI, "bid engine (redis) uri")
 	websiteCmd.Flags().StringVar(&postgresDSN, "db", defaultPostgresDSN, "PostgreSQL DSN")
 	websiteCmd.Flags().StringVar(&websitePubkeyOverride, "pubkey-override", os.Getenv("PUBKEY_OVERRIDE"), "override for public key")
 
@@ -72,13 +71,13 @@ var websiteCmd = &cobra.Command{
 
 		// Connect to Redis
 		if redisReadonlyURI == "" {
-			log.Infof("Connecting to Redis at %s / bidengine %s ...", redisURI, bidEngineURI)
+			log.Infof("Connecting to Redis at %s ...", redisURI)
 		} else {
-			log.Infof("Connecting to Redis at %s / readonly: %s / bidengine %s ...", redisURI, redisReadonlyURI, bidEngineURI)
+			log.Infof("Connecting to Redis at %s / readonly: %s ...", redisURI, redisReadonlyURI)
 		}
-		redis, err := datastore.NewRedisCache(networkInfo.Name, redisURI, redisReadonlyURI, bidEngineURI)
+		redis, err := datastore.NewRedisCache(networkInfo.Name, redisURI, redisReadonlyURI, "", "")
 		if err != nil {
-			log.WithError(err).Fatalf("Failed to connect to Redis at %s / bidengine %s", redisURI, bidEngineURI)
+			log.WithError(err).Fatalf("Failed to connect to Redis at %s", redisURI)
 		}
 
 		relayPubkey := ""
