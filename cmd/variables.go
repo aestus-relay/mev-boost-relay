@@ -16,6 +16,7 @@ var (
 	defaultBidEngineROURI    = common.GetEnv("REDIS_BIDENGINE_RO_URI", "")
 	defaultPostgresDSN       = common.GetEnv("POSTGRES_DSN", "")
 	defaultMemcachedURIs     = common.GetSliceEnv("MEMCACHED_URIS", nil)
+	defaultLatencySvcURI     = common.GetEnv("LATENCY_SVC_URI", "")
 	defaultLogJSON           = os.Getenv("LOG_JSON") != ""
 	defaultLogLevel          = common.GetEnv("LOG_LEVEL", "info")
 
@@ -28,6 +29,7 @@ var (
 	bidEngineROURI        string
 	postgresDSN           string
 	memcachedURIs         []string
+	latencySvcURI         string
 
 	logJSON  bool
 	logLevel string

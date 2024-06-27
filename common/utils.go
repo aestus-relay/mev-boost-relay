@@ -98,6 +98,30 @@ func GetSliceEnv(key string, defaultValue []string) []string {
 	return defaultValue
 }
 
+// GetEnvUint returns the value of the environment variable named by key, or defaultValue if the environment variable
+// doesn't exist or is not a valid uint64
+func GetEnvUint(key string, defaultValue uint64) uint64 {
+	if value, ok := os.LookupEnv(key); ok {
+		val, err := strconv.ParseUint(value, 10, 64)
+		if err == nil {
+			return val
+		}
+	}
+	return defaultValue
+}
+
+// GetEnvFloat returns the value of the environment variable named by key, or defaultValue if the environment variable
+// doesn't exist or is not a valid float
+func GetEnvFloat(key string, defaultValue float64) float64 {
+	if value, ok := os.LookupEnv(key); ok {
+		val, err := strconv.ParseFloat(value, 64)
+		if err == nil {
+			return val
+		}
+	}
+	return defaultValue
+}
+
 func GetIPXForwardedFor(r *http.Request) string {
 	forwarded := r.Header.Get("X-Forwarded-For")
 	if forwarded != "" {

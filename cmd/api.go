@@ -62,6 +62,7 @@ func init() {
 	apiCmd.Flags().StringVar(&postgresDSN, "db", defaultPostgresDSN, "PostgreSQL DSN")
 	apiCmd.Flags().StringSliceVar(&memcachedURIs, "memcached-uris", defaultMemcachedURIs,
 		"Enable memcached, typically used as secondary backup to Redis for redundancy")
+	apiCmd.Flags().StringVar(&latencySvcURI, "latency-svc-uri", defaultLatencySvcURI, "latency service uri")
 	apiCmd.Flags().StringVar(&apiSecretKey, "secret-key", apiDefaultSecretKey, "secret key for signing bids")
 	apiCmd.Flags().StringVar(&apiBlockSimURL, "blocksim", apiDefaultBlockSim, "URL for block simulator")
 	apiCmd.Flags().StringVar(&network, "network", defaultNetwork, "Which network to use")
@@ -158,6 +159,9 @@ var apiCmd = &cobra.Command{
 			log.WithError(err).Fatalf("Failed setting up prod datastore")
 		}
 
+		// Set up latency estimator
+		le := api.NewLatencyEstimator(latencySvcURI)
+
 		opts := api.RelayAPIOpts{
 			Log:           log,
 			ListenAddr:    apiListenAddr,
@@ -166,6 +170,7 @@ var apiCmd = &cobra.Command{
 			Redis:         redis,
 			Memcached:     mem,
 			DB:            db,
+			LatencySvc:    le,
 			EthNetDetails: *networkInfo,
 			BlockSimURL:   apiBlockSimURL,
 

@@ -12,7 +12,6 @@ import (
 	"math/big"
 	"net/http"
 	_ "net/http/pprof"
-	"net/url"
 	"os"
 	"sort"
 	"strconv"
@@ -92,12 +91,12 @@ var (
 	numValidatorRegProcessors = cli.GetEnvInt("NUM_VALIDATOR_REG_PROCESSORS", 10)
 
 	// various timings
-	timeoutGetPayloadRetryMs   = cli.GetEnvInt("GETPAYLOAD_RETRY_TIMEOUT_MS", 100)
-	getHeaderRequestCutoffMs   = cli.GetEnvInt("GETHEADER_REQUEST_CUTOFF_MS", 3000)
-	getHeaderResponseMaxSlotMs = cli.GetEnvInt("GETHEADER_REQUEST_MAX_SLOT_MS", 2000)
-	getHeaderResponseDelayMs   = cli.GetEnvInt("GETHEADER_RESPONSE_DELAY_MS", 0)
-	getPayloadRequestCutoffMs  = cli.GetEnvInt("GETPAYLOAD_REQUEST_CUTOFF_MS", 4000)
-	getPayloadResponseDelayMs  = cli.GetEnvInt("GETPAYLOAD_RESPONSE_DELAY_MS", 1000)
+	timeoutGetPayloadRetryMs     = cli.GetEnvInt("GETPAYLOAD_RETRY_TIMEOUT_MS", 100)
+	getHeaderRequestCutoffMs     = cli.GetEnvInt("GETHEADER_REQUEST_CUTOFF_MS", 3000)
+	getHeaderResponseMaxSlotMs   = cli.GetEnvInt("GETHEADER_REQUEST_MAX_SLOT_MS", 2000)
+	getHeaderResponseReceiveByMs = common.GetEnvUint("GETHEADER_RESPONSE_RECEIVE_BY_MS", 0)
+	getPayloadRequestCutoffMs    = cli.GetEnvInt("GETPAYLOAD_REQUEST_CUTOFF_MS", 4000)
+	getPayloadResponseDelayMs    = cli.GetEnvInt("GETPAYLOAD_RESPONSE_DELAY_MS", 1000)
 
 	// api settings
 	apiReadTimeoutMs       = cli.GetEnvInt("API_TIMEOUT_READ_MS", 1500)
@@ -140,6 +139,7 @@ type RelayAPIOpts struct {
 	Redis        *datastore.RedisCache
 	Memcached    *datastore.Memcached
 	DB           database.IDatabaseService
+	LatencySvc   *LatencyEstimator
 
 	SecretKey *bls.SecretKey // used to sign bids (getHeader responses)
 
@@ -196,11 +196,12 @@ type RelayAPI struct {
 	srvStarted  uberatomic.Bool
 	srvShutdown uberatomic.Bool
 
-	beaconClient beaconclient.IMultiBeaconClient
-	datastore    *datastore.Datastore
-	redis        *datastore.RedisCache
-	memcached    *datastore.Memcached
-	db           database.IDatabaseService
+	beaconClient     beaconclient.IMultiBeaconClient
+	datastore        *datastore.Datastore
+	redis            *datastore.RedisCache
+	memcached        *datastore.Memcached
+	db               database.IDatabaseService
+	latencySvc       *LatencyEstimator
 
 	headSlot     uberatomic.Uint64
 	genesisInfo  *beaconclient.GetGenesisResponse
@@ -305,6 +306,7 @@ func NewRelayAPI(opts RelayAPIOpts) (api *RelayAPI, err error) {
 		redis:        opts.Redis,
 		memcached:    opts.Memcached,
 		db:           opts.DB,
+		latencySvc:   opts.LatencySvc,
 
 		payloadAttributes: make(map[string]payloadAttributesHelper),
 
@@ -995,8 +997,8 @@ func (api *RelayAPI) Respond(w http.ResponseWriter, code int, response any) {
 
 func (api *RelayAPI) handleStatus(w http.ResponseWriter, req *http.Request) {
 	// Delay the response if parameters call for it
-	delayMs := api.computeDelay(req.UserAgent(), req.URL.Query(), 0)
-	time.Sleep(time.Duration(delayMs) * time.Millisecond)
+	// delayMs := api.computeDelay(req, 0)
+	// time.Sleep(time.Duration(delayMs) * time.Millisecond)
 
 	w.WriteHeader(http.StatusOK)
 }
@@ -1230,26 +1232,38 @@ func (api *RelayAPI) handleRegisterValidator(w http.ResponseWriter, req *http.Re
 	w.WriteHeader(http.StatusOK)
 }
 
-func (api *RelayAPI) computeDelay(ua string, args url.Values, msIntoSlot int64) uint64 {
+func (api *RelayAPI) computeDelay(req *http.Request, msIntoSlot int64) uint64 {
 	// By default, delay responses only to likely proposer user agents
 	delayMs := uint64(0)
 	for _, delayedUA := range apiDelayedHeaderUserAgents {
-		if strings.Contains(ua, delayedUA) {
-			delayMs = uint64(getHeaderResponseDelayMs)
+		if strings.Contains(req.UserAgent(), delayedUA) {
+			// Use latency estimator to estimate delay needed to target the receipt time
+			maxElapsedMs := uint64(msIntoSlot)
+			if msIntoSlot <= 0 {
+				maxElapsedMs = uint64(12_000)
+			}
+			elapsedMs, responseMs, err := api.latencySvc.EstimateTiming(req, maxElapsedMs)
+			if err != nil {
+				api.log.WithError(err).Warn("error estimating latency-based delay")
+			}
+			if getHeaderResponseReceiveByMs > elapsedMs + responseMs {
+				delayMs = getHeaderResponseReceiveByMs - elapsedMs - responseMs
+			}
 			break
 		}
 	}
 
 	// Parse user delay parameters
 	cutoff := uint64(getHeaderResponseMaxSlotMs)
-	if args.Get("headerCutoff") != "" && getHeaderResponseDelayMs != 0 {
+	args := req.URL.Query()
+	if args.Get("headerCutoff") != "" && getHeaderResponseReceiveByMs != 0 {
 		userCutoff, err := strconv.ParseUint(args.Get("headerCutoff"), 10, 64)
 		if err == nil && userCutoff <= uint64(getHeaderRequestCutoffMs) {
 			cutoff = userCutoff
 		}
 	}
 
-	if args.Get("headerDelay") != "" && getHeaderResponseDelayMs != 0 {
+	if args.Get("headerDelay") != "" && getHeaderResponseReceiveByMs != 0 {
 		userDelay, err := strconv.ParseUint(args.Get("headerDelay"), 10, 64)
 		if err == nil {
 			delayMs = userDelay
@@ -1258,9 +1272,14 @@ func (api *RelayAPI) computeDelay(ua string, args url.Values, msIntoSlot int64) 
 
 	// Do not allow delay past cutoff
 	if int64(cutoff)-msIntoSlot < int64(delayMs) {
-		delayMs = cutoff - uint64(msIntoSlot)
+		if int64(cutoff)-msIntoSlot < 0 {
+			delayMs = uint64(0)
+		} else {
+			delayMs = cutoff - uint64(msIntoSlot)
+		}
 	}
 
+	fmt.Printf("TGAAS: msIntoSlot=%d cutoff=%d delayMs=%d\n", msIntoSlot, cutoff, delayMs)
 	return delayMs
 }
 
@@ -1338,7 +1357,7 @@ func (api *RelayAPI) handleGetHeader(w http.ResponseWriter, req *http.Request) {
 	}
 
 	// Delay the response if parameters call for it
-	delayMs := api.computeDelay(ua, req.URL.Query(), msIntoSlot)
+	delayMs := api.computeDelay(req, msIntoSlot)
 	time.Sleep(time.Duration(delayMs) * time.Millisecond)
 
 	bid, err := api.redis.GetBestBid(slot, parentHashHex, proposerPubkeyHex)
