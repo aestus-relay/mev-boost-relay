@@ -7,11 +7,13 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/flashbots/go-utils/cli"
 	"github.com/flashbots/mev-boost-relay/common"
+	"github.com/sirupsen/logrus"
 )
 
 var (
@@ -41,14 +43,16 @@ type LatencyResponse struct {
 type LatencyEstimator struct {
 	latencyServiceURI string
 	client *http.Client
+	log    *logrus.Entry
 }
 
-func NewLatencyEstimator(latencyServiceURI string) *LatencyEstimator {
+func NewLatencyEstimator(latencyServiceURI string, log *logrus.Entry) *LatencyEstimator {
 	return &LatencyEstimator{
 		latencyServiceURI: latencyServiceURI,
 		client: &http.Client{ //nolint:exhaustivestruct
 			Timeout: latencyRequestTimeout,
 		},
+		log: log,
 	}
 }
 
@@ -61,7 +65,6 @@ func (le *LatencyEstimator) GetRtt(ip string) (respData LatencyResponse, err err
 		return respData, err
 	}
 
-	start := time.Now()
 	req, err := http.NewRequest("GET", le.latencyServiceURI, bytes.NewReader(reqBytes))
 	if err != nil {
 		return respData, err
@@ -80,7 +83,6 @@ func (le *LatencyEstimator) GetRtt(ip string) (respData LatencyResponse, err err
 	if err := json.NewDecoder(resp.Body).Decode(&respData); err != nil {
 		return respData, err
 	}
-	fmt.Printf("TGAAS: latency service request took %v\n", time.Since(start))
 	return respData, nil
 }
 
@@ -100,36 +102,71 @@ func (le *LatencyEstimator) GetClientIP(r *http.Request) (clientIP string, err e
 			return "", err
 		}
 	}
-	fmt.Printf("TGAAS: real-ip=%s, forwarded-for=%s, remote-addr=%s\n", r.Header.Get("X-Real-IP"), r.Header.Get("X-Forwarded-For"), r.RemoteAddr)
 	return clientIP, nil
+}
+
+func (le *LatencyEstimator) GetStartTime(r *http.Request) (timeMs uint64, err error) {
+	startTimeStr := r.Header.Get("X-MEVBoost-StartTimeUnixMS")
+	if startTimeStr == "" {
+		return 0, errors.New("no start time in header")
+	}
+	startTimeMs, err := strconv.ParseUint(startTimeStr, 10, 64)
+	if err != nil {
+		return 0, err
+	}
+
+	// Ensure time is in the past
+	if startTimeMs > uint64(time.Now().UTC().UnixMilli()) {
+		return 0, errors.New("start time is in the future")
+	}
+	return startTimeMs, nil
 }
 
 // Estimates the elapsed time since the client intiated the request
 // and the time needed for response to be sent back to the client
 // maxElapsedMs is a known limit: the call could not have been initated more than maxElapsedMs ago
 // Errors are not fatal but returned for logging; a viable usable default value is always returned
-func (le *LatencyEstimator) EstimateTiming(r *http.Request, maxElapsedMs uint64) (elapsedMs, responseMs uint64, err error) {
+func (le *LatencyEstimator) EstimateTiming(r *http.Request, maxElapsedMs uint64) (elapsedMs, responseMs uint64) {
 	start := time.Now()
 	rtt := uint64(defaultClientRttMs)
-	clientIP, err := le.GetClientIP(r)
-	var respData LatencyResponse
-	if err == nil {
-		respData, err = le.GetRtt(clientIP)
-		if err == nil && respData.RttAv >= 0 {
-			rtt = uint64(respData.RttAv)
-		} else if err != nil {
-			fmt.Printf("TGAAS: failed to get RTT for clientIP=%s: %v\n", clientIP, err)
+	log := le.log
+
+	// Use either header start time or latency service for RTT
+	headerStart, headerErr := le.GetStartTime(r)
+	if headerErr == nil {
+		log = log.WithFields(logrus.Fields{"delayMethod": "header",})
+
+		elapsedMs = uint64(start.UTC().UnixMilli()) - headerStart
+		rtt = uint64(float64(elapsedMs) / rttToHandshakeScale)
+	} else {
+		log = log.WithFields(logrus.Fields{"delayMethod": "latency",})
+
+		// Query latency service for RTT
+		clientIP, err := le.GetClientIP(r)
+		var respData LatencyResponse
+		if err == nil {
+			respData, err = le.GetRtt(clientIP)
+			if err == nil && respData.RttAv >= 0 {
+				rtt = uint64(respData.RttAv)
+			}
+		} else {
+			log.WithError(err).Warn("error estimating latency-based delay")
 		}
+		elapsedMs = uint64(float64(rtt) * rttToHandshakeScale)
 	}
 
-	responseMs = uint64(float64(rtt) * rttToResponseScale)
-
-	// Estimate elapsed time from latency service first, cap at maxElapsedMs, and add time spent in this fn
-	elapsedMs = uint64(float64(rtt) * rttToHandshakeScale)
+	// Cap at maxElapsedMs, and add time spent in this fn
 	if elapsedMs > maxElapsedMs {
 		elapsedMs = maxElapsedMs
 	}
 	elapsedMs += uint64(time.Since(start).Milliseconds())
-	fmt.Printf("TGAAS: clientIP=%s, RttAv=%d rtt=%d, elapsedMs=%d, responseMs=%d\n", clientIP, respData.RttAv, rtt, elapsedMs, responseMs)
-	return elapsedMs, responseMs, err
+
+	responseMs = uint64(float64(rtt) * rttToResponseScale)
+
+	log.WithFields(logrus.Fields{
+		"rtt":         rtt,
+		"elapsedMs":   elapsedMs,
+		"responseMs":  responseMs,
+	}).Info("Estimated delay timing parameters")
+	return elapsedMs, responseMs
 }

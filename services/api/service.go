@@ -123,6 +123,7 @@ var (
 	apiDelayedHeaderUserAgents = common.GetEnvStrSlice("DELAYED_HEADER_USERAGENTS", []string{
 		"mev-boost",
 		"Vouch",
+		"commit-boost",
 		"delay",
 	})
 )
@@ -1235,6 +1236,11 @@ func (api *RelayAPI) handleRegisterValidator(w http.ResponseWriter, req *http.Re
 func (api *RelayAPI) computeDelay(req *http.Request, msIntoSlot int64) uint64 {
 	// By default, delay responses only to likely proposer user agents
 	delayMs := uint64(0)
+	log := api.log.WithFields(logrus.Fields{
+		"ua": req.UserAgent(),
+		"msIntoSlot": msIntoSlot,
+	})
+	delayed := false
 	for _, delayedUA := range apiDelayedHeaderUserAgents {
 		if strings.Contains(req.UserAgent(), delayedUA) {
 			// Use latency estimator to estimate delay needed to target the receipt time
@@ -1242,13 +1248,12 @@ func (api *RelayAPI) computeDelay(req *http.Request, msIntoSlot int64) uint64 {
 			if msIntoSlot <= 0 {
 				maxElapsedMs = uint64(12_000)
 			}
-			elapsedMs, responseMs, err := api.latencySvc.EstimateTiming(req, maxElapsedMs)
-			if err != nil {
-				api.log.WithError(err).Warn("error estimating latency-based delay")
-			}
+			elapsedMs, responseMs := api.latencySvc.EstimateTiming(req, maxElapsedMs)
 			if getHeaderResponseReceiveByMs > elapsedMs + responseMs {
 				delayMs = getHeaderResponseReceiveByMs - elapsedMs - responseMs
 			}
+			delayed = true
+			log = log.WithFields(logrus.Fields{"elapsedMs": elapsedMs,})
 			break
 		}
 	}
@@ -1279,7 +1284,13 @@ func (api *RelayAPI) computeDelay(req *http.Request, msIntoSlot int64) uint64 {
 		}
 	}
 
-	fmt.Printf("TGAAS: msIntoSlot=%d cutoff=%d delayMs=%d\n", msIntoSlot, cutoff, delayMs)
+	if delayed {
+		log.WithFields(logrus.Fields{
+			"cutoff":     cutoff,
+			"delayMs":    delayMs,
+		}).Info("Delaying getHeader response")
+	}
+
 	return delayMs
 }
 

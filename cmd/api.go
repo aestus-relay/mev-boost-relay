@@ -160,7 +160,7 @@ var apiCmd = &cobra.Command{
 		}
 
 		// Set up latency estimator
-		le := api.NewLatencyEstimator(latencySvcURI)
+		le := api.NewLatencyEstimator(latencySvcURI, log)
 
 		opts := api.RelayAPIOpts{
 			Log:           log,
