@@ -1236,42 +1236,51 @@ func (api *RelayAPI) handleRegisterValidator(w http.ResponseWriter, req *http.Re
 func (api *RelayAPI) computeDelay(req *http.Request, msIntoSlot int64) uint64 {
 	// By default, delay responses only to likely proposer user agents
 	delayMs := uint64(0)
+	args := req.URL.Query()
 	log := api.log.WithFields(logrus.Fields{
 		"ua": req.UserAgent(),
 		"msIntoSlot": msIntoSlot,
 	})
+
+	// Check for delay from user agent or delay parameter
 	delayed := false
 	for _, delayedUA := range apiDelayedHeaderUserAgents {
 		if strings.Contains(req.UserAgent(), delayedUA) {
-			// Use latency estimator to estimate delay needed to target the receipt time
-			maxElapsedMs := uint64(msIntoSlot)
-			if msIntoSlot <= 0 {
-				maxElapsedMs = uint64(12_000)
-			}
-			elapsedMs, responseMs := api.latencySvc.EstimateTiming(req, maxElapsedMs)
-			if getHeaderResponseReceiveByMs > elapsedMs + responseMs {
-				delayMs = getHeaderResponseReceiveByMs - elapsedMs - responseMs
-			}
 			delayed = true
-			log = log.WithFields(logrus.Fields{"elapsedMs": elapsedMs,})
 			break
 		}
 	}
+	receiveByMs := uint64(getHeaderResponseReceiveByMs)
+	if args.Get("headerDelay") != "" && getHeaderResponseReceiveByMs != 0 {
+		userDelay, err := strconv.ParseUint(args.Get("headerDelay"), 10, 64)
+		if err == nil {
+			receiveByMs = userDelay
+			delayed = true
+		}
+		if receiveByMs == 0 {
+			delayed = false
+		}
+	}
 
-	// Parse user delay parameters
+	if delayed {
+		// Use latency estimator to estimate delay needed to target the receipt time
+		maxElapsedMs := uint64(msIntoSlot)
+		if msIntoSlot <= 0 {
+			maxElapsedMs = uint64(12_000)
+		}
+		elapsedMs, responseMs := api.latencySvc.EstimateTiming(req, maxElapsedMs)
+		if receiveByMs > elapsedMs + responseMs {
+			delayMs = receiveByMs - elapsedMs - responseMs
+		}
+		log = log.WithFields(logrus.Fields{"elapsedMs": elapsedMs,})
+	}
+
+	// Parse user cutoff parameter
 	cutoff := uint64(getHeaderResponseMaxSlotMs)
-	args := req.URL.Query()
 	if args.Get("headerCutoff") != "" && getHeaderResponseReceiveByMs != 0 {
 		userCutoff, err := strconv.ParseUint(args.Get("headerCutoff"), 10, 64)
 		if err == nil && userCutoff <= uint64(getHeaderRequestCutoffMs) {
 			cutoff = userCutoff
-		}
-	}
-
-	if args.Get("headerDelay") != "" && getHeaderResponseReceiveByMs != 0 {
-		userDelay, err := strconv.ParseUint(args.Get("headerDelay"), 10, 64)
-		if err == nil {
-			delayMs = userDelay
 		}
 	}
 
