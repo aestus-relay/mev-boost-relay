@@ -42,6 +42,8 @@ import (
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/sirupsen/logrus"
+	"go.opentelemetry.io/otel/attribute"
+	otelapi "go.opentelemetry.io/otel/metric"
 	uberatomic "go.uber.org/atomic"
 	"golang.org/x/exp/slices"
 )
@@ -175,6 +177,7 @@ type blockBuilderCacheEntry struct {
 
 type blockSimResult struct {
 	wasSimulated         bool
+	blockValue           *uint256.Int
 	optimisticSubmission bool
 	requestErr           error
 	validationErr        error
@@ -212,6 +215,9 @@ type RelayAPI struct {
 	blockSimRateLimiter IBlockSimRateLimiter
 
 	validatorRegC chan builderApiV1.SignedValidatorRegistration
+
+	// used to notify when a new validator has been registered
+	validatorUpdateCh chan struct{}
 
 	// used to wait on any active getPayload calls on shutdown
 	getPayloadCallsInFlight sync.WaitGroup
@@ -304,7 +310,8 @@ func NewRelayAPI(opts RelayAPIOpts) (api *RelayAPI, err error) {
 		proposerDutiesResponse: &[]byte{},
 		blockSimRateLimiter:    NewBlockSimulationRateLimiter(opts.BlockSimURL),
 
-		validatorRegC: make(chan builderApiV1.SignedValidatorRegistration, 450_000),
+		validatorRegC:     make(chan builderApiV1.SignedValidatorRegistration, 450_000),
+		validatorUpdateCh: make(chan struct{}),
 	}
 
 	if os.Getenv("FORCE_GET_HEADER_204") == "1" {
@@ -471,6 +478,9 @@ func (api *RelayAPI) StartServer() (err error) {
 
 	// start block-builder API specific things
 	if api.opts.BlockBuilderAPI {
+		// Initialize metrics
+		metrics.BuilderDemotionCount.Add(context.Background(), 0)
+
 		// Get current proposer duties blocking before starting, to have them ready
 		api.updateProposerDuties(syncStatus.HeadSlot)
 
@@ -570,6 +580,10 @@ func (api *RelayAPI) StopServer() (err error) {
 	return api.srv.Shutdown(context.Background())
 }
 
+func (api *RelayAPI) ValidatorUpdateCh() chan struct{} {
+	return api.validatorUpdateCh
+}
+
 func (api *RelayAPI) isCapella(slot uint64) bool {
 	return hasReachedFork(slot, api.capellaEpoch) && !hasReachedFork(slot, api.denebEpoch)
 }
@@ -593,9 +607,9 @@ func (api *RelayAPI) startValidatorRegistrationDBProcessor() {
 }
 
 // simulateBlock sends a request for a block simulation to blockSimRateLimiter.
-func (api *RelayAPI) simulateBlock(ctx context.Context, opts blockSimOptions) (requestErr, validationErr error) {
+func (api *RelayAPI) simulateBlock(ctx context.Context, opts blockSimOptions) (blockValue *uint256.Int, requestErr, validationErr error) {
 	t := time.Now()
-	requestErr, validationErr = api.blockSimRateLimiter.Send(ctx, opts.req, opts.isHighPrio, opts.fastTrack)
+	response, requestErr, validationErr := api.blockSimRateLimiter.Send(ctx, opts.req, opts.isHighPrio, opts.fastTrack)
 	log := opts.log.WithFields(logrus.Fields{
 		"durationMs": time.Since(t).Milliseconds(),
 		"numWaiting": api.blockSimRateLimiter.CurrentCounter(),
@@ -606,21 +620,31 @@ func (api *RelayAPI) simulateBlock(ctx context.Context, opts blockSimOptions) (r
 			ignoreError := validationErr.Error() == ErrBlockAlreadyKnown || validationErr.Error() == ErrBlockRequiresReorg || strings.Contains(validationErr.Error(), ErrMissingTrieNode)
 			if ignoreError {
 				log.WithError(validationErr).Warn("block validation failed with ignorable error")
-				return nil, nil
+				return nil, nil, nil
 			}
 		}
 		log.WithError(validationErr).Warn("block validation failed")
-		return nil, validationErr
+		return nil, nil, validationErr
 	}
 	if requestErr != nil {
 		log.WithError(requestErr).Warn("block validation failed: request error")
-		return requestErr, nil
+		return nil, requestErr, nil
 	}
+
 	log.Info("block validation successful")
-	return nil, nil
+	if response == nil {
+		log.Warn("block validation response is nil")
+		return nil, nil, nil
+	}
+	return response.BlockValue, nil, nil
 }
 
 func (api *RelayAPI) demoteBuilder(pubkey string, req *common.VersionedSubmitBlockRequest, simError error) {
+	metrics.BuilderDemotionCount.Add(
+		context.Background(),
+		1,
+	)
+
 	builderEntry, ok := api.blockBuildersCache[pubkey]
 	if !ok {
 		api.log.Warnf("builder %v not in the builder cache", pubkey)
@@ -679,8 +703,8 @@ func (api *RelayAPI) processOptimisticBlock(opts blockSimOptions, simResultC cha
 		// it for logging, it is not atomic to avoid the performance impact.
 		"optBlocksInFlight": api.optimisticBlocksInFlight,
 	}).Infof("simulating optimistic block with hash: %v", submission.BidTrace.BlockHash.String())
-	reqErr, simErr := api.simulateBlock(ctx, opts)
-	simResultC <- &blockSimResult{reqErr == nil, true, reqErr, simErr}
+	blockValue, reqErr, simErr := api.simulateBlock(ctx, opts)
+	simResultC <- &blockSimResult{reqErr == nil, blockValue, true, reqErr, simErr}
 	if reqErr != nil || simErr != nil {
 		var demotionErr error
 		if reqErr != nil {
@@ -845,6 +869,10 @@ func (api *RelayAPI) updateProposerDuties(headSlot uint64) {
 		return
 	}
 
+	api.UpdateProposerDutiesWithoutChecks(headSlot)
+}
+
+func (api *RelayAPI) UpdateProposerDutiesWithoutChecks(headSlot uint64) {
 	// Load upcoming proposer duties from Redis
 	duties, err := api.redis.GetProposerDuties()
 	if err != nil {
@@ -1191,6 +1219,12 @@ func (api *RelayAPI) handleRegisterValidator(w http.ResponseWriter, req *http.Re
 		return
 	}
 
+	// notify that new registrations are available
+	select {
+	case api.validatorUpdateCh <- struct{}{}:
+	default:
+	}
+
 	log.Info("validator registrations call processed")
 	w.WriteHeader(http.StatusOK)
 }
@@ -1276,6 +1310,12 @@ func (api *RelayAPI) handleGetHeader(w http.ResponseWriter, req *http.Request) {
 	}
 
 	log.Debug("getHeader request received")
+	defer func() {
+		metrics.GetHeaderLatencyHistogram.Record(
+			req.Context(),
+			float64(time.Since(requestTime).Milliseconds()),
+		)
+	}()
 
 	if slices.Contains(apiNoHeaderUserAgents, ua) {
 		log.Info("rejecting getHeader by user agent")
@@ -1333,6 +1373,7 @@ func (api *RelayAPI) handleGetHeader(w http.ResponseWriter, req *http.Request) {
 		"value":     value.String(),
 		"blockHash": blockHash.String(),
 	}).Info("bid delivered")
+
 	api.RespondOK(w, bid)
 }
 
@@ -1891,7 +1932,7 @@ func (api *RelayAPI) checkFloorBidValue(opts bidFloorOpts) (*big.Int, bool) {
 	isBidBelowFloor := floorBidValue != nil && opts.submission.BidTrace.Value.ToBig().Cmp(floorBidValue) == -1
 	isBidAtOrBelowFloor := floorBidValue != nil && opts.submission.BidTrace.Value.ToBig().Cmp(floorBidValue) < 1
 	if opts.cancellationsEnabled && isBidBelowFloor { // with cancellations: if below floor -> delete previous bid
-		opts.simResultC <- &blockSimResult{false, false, nil, nil}
+		opts.simResultC <- &blockSimResult{false, nil, false, nil, nil}
 		opts.log.Info("submission below floor bid value, with cancellation")
 		err := api.redis.DelBuilderBid(context.Background(), opts.tx, opts.submission.BidTrace.Slot, opts.submission.BidTrace.ParentHash.String(), opts.submission.BidTrace.ProposerPubkey.String(), opts.submission.BidTrace.BuilderPubkey.String())
 		if err != nil {
@@ -1902,7 +1943,7 @@ func (api *RelayAPI) checkFloorBidValue(opts bidFloorOpts) (*big.Int, bool) {
 		api.Respond(opts.w, http.StatusAccepted, "accepted bid below floor, skipped validation")
 		return nil, false
 	} else if !opts.cancellationsEnabled && isBidAtOrBelowFloor { // without cancellations: if at or below floor -> ignore
-		opts.simResultC <- &blockSimResult{false, false, nil, nil}
+		opts.simResultC <- &blockSimResult{false, nil, false, nil, nil}
 		opts.log.Info("submission at or below floor bid value, without cancellation")
 		api.RespondMsg(opts.w, http.StatusAccepted, "accepted bid below floor, skipped validation")
 		return nil, false
@@ -1990,6 +2031,9 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 			"timestampRequestFin": time.Now().UTC().UnixMilli(),
 			"requestDurationMs":   time.Since(receivedAt).Milliseconds(),
 		}).Info("request finished")
+
+		// metrics
+		api.saveBlockSubmissionMetrics(pf, receivedAt)
 	}()
 
 	// If cancellations are disabled but builder requested it, return error
@@ -2002,6 +2046,7 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 	var err error
 	var r io.Reader = req.Body
 	isGzip := req.Header.Get("Content-Encoding") == "gzip"
+	pf.IsGzip = isGzip
 	log = log.WithField("reqIsGzip", isGzip)
 	if isGzip {
 		r, err = gzip.NewReader(req.Body)
@@ -2030,6 +2075,7 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 	contentType := req.Header.Get("Content-Type")
 	if contentType == "application/octet-stream" {
 		log = log.WithField("reqContentType", "ssz")
+		pf.ContentType = "ssz"
 		if err = payload.UnmarshalSSZ(requestPayloadBytes); err != nil {
 			log.WithError(err).Warn("could not decode payload - SSZ")
 
@@ -2040,11 +2086,13 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 				return
 			}
 			log = log.WithField("reqContentType", "json")
+			pf.ContentType = "json"
 		} else {
 			log.Debug("received ssz-encoded payload")
 		}
 	} else {
 		log = log.WithField("reqContentType", "json")
+		pf.ContentType = "json"
 		if err := json.Unmarshal(requestPayloadBytes, payload); err != nil {
 			log.WithError(err).Warn("could not decode payload - JSON")
 			api.RespondError(w, http.StatusBadRequest, err.Error())
@@ -2160,6 +2208,7 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 		return
 	}
 
+	pf.AboveFloorBid = true
 	log = log.WithField("timestampAfterCheckingFloorBid", time.Now().UTC().UnixMilli())
 
 	// Deferred saving of the builder submission to database (whenever this function ends)
@@ -2170,12 +2219,15 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 		case simResult = <-simResultC:
 		case <-time.After(10 * time.Second):
 			log.Warn("timed out waiting for simulation result")
-			simResult = &blockSimResult{false, false, nil, nil}
+			simResult = &blockSimResult{false, nil, false, nil, nil}
 		}
 
-		submissionEntry, err := api.db.SaveBuilderBlockSubmission(payload, simResult.requestErr, simResult.validationErr, receivedAt, eligibleAt, simResult.wasSimulated, savePayloadToDatabase, pf, simResult.optimisticSubmission)
+		submissionEntry, err := api.db.SaveBuilderBlockSubmission(payload, simResult.requestErr, simResult.validationErr, receivedAt, eligibleAt, simResult.wasSimulated, savePayloadToDatabase, pf, simResult.optimisticSubmission, simResult.blockValue)
 		if err != nil {
-			log.WithError(err).WithField("payload", payload).Error("saving builder block submission to database failed")
+			log.WithError(err).WithFields(logrus.Fields{
+				"payload":   payload,
+				"simResult": simResult,
+			}).Error("saving builder block submission to database failed")
 			return
 		}
 
@@ -2232,14 +2284,16 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 		},
 	}
 	// With sufficient collateral, process the block optimistically.
-	if builderEntry.status.IsOptimistic &&
+	optimistic := builderEntry.status.IsOptimistic &&
 		builderEntry.collateral.Cmp(submission.BidTrace.Value.ToBig()) >= 0 &&
-		submission.BidTrace.Slot == api.optimisticSlot.Load() {
+		submission.BidTrace.Slot == api.optimisticSlot.Load()
+	pf.Optimistic = optimistic
+	if optimistic {
 		go api.processOptimisticBlock(opts, simResultC)
 	} else {
 		// Simulate block (synchronously).
-		requestErr, validationErr := api.simulateBlock(context.Background(), opts) // success/error logging happens inside
-		simResultC <- &blockSimResult{requestErr == nil, false, requestErr, validationErr}
+		blockValue, requestErr, validationErr := api.simulateBlock(context.Background(), opts) // success/error logging happens inside
+		simResultC <- &blockSimResult{requestErr == nil, blockValue, false, requestErr, validationErr}
 		validationDurationMs := time.Since(timeBeforeValidation).Milliseconds()
 		log = log.WithFields(logrus.Fields{
 			"timestampAfterValidation": time.Now().UTC().UnixMilli(),
@@ -2262,6 +2316,7 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 
 	nextTime = time.Now().UTC()
 	pf.Simulation = uint64(nextTime.Sub(prevTime).Microseconds())
+	pf.SimulationSuccess = true
 	prevTime = nextTime
 
 	// If cancellations are enabled, then abort now if this submission is not the latest one
@@ -2329,6 +2384,10 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 
 	nextTime = time.Now().UTC()
 	pf.RedisUpdate = uint64(nextTime.Sub(prevTime).Microseconds())
+	pf.WasBidSaved = updateBidResult.WasBidSaved
+	pf.RedisSavePayload = uint64(updateBidResult.TimeSavePayload.Microseconds())
+	pf.RedisUpdateTopBid = uint64(updateBidResult.TimeUpdateTopBid.Microseconds())
+	pf.RedisUpdateFloor = uint64(updateBidResult.TimeUpdateFloor.Microseconds())
 	pf.Total = uint64(nextTime.Sub(receivedAt).Microseconds())
 
 	// All done, log with profiling information
@@ -2340,6 +2399,80 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 		"profileTotalUs":     pf.Total,
 	}).Info("received block from builder")
 	w.WriteHeader(http.StatusOK)
+}
+
+func (api *RelayAPI) saveBlockSubmissionMetrics(pf common.Profile, receivedTime time.Time) {
+	if pf.PayloadLoad > 0 {
+		metrics.SubmitNewBlockReadLatencyHistogram.Record(
+			context.Background(),
+			float64(pf.PayloadLoad)/1000,
+			otelapi.WithAttributes(attribute.Bool("isGzip", pf.IsGzip)),
+		)
+	}
+	if pf.Decode > 0 {
+		metrics.SubmitNewBlockDecodeLatencyHistogram.Record(
+			context.Background(),
+			float64(pf.Decode)/1000,
+			otelapi.WithAttributes(attribute.String("contentType", pf.ContentType)),
+		)
+	}
+
+	if pf.Prechecks > 0 {
+		metrics.SubmitNewBlockPrechecksLatencyHistogram.Record(
+			context.Background(),
+			float64(pf.Prechecks)/1000,
+		)
+	}
+
+	if pf.Simulation > 0 {
+		metrics.SubmitNewBlockSimulationLatencyHistogram.Record(
+			context.Background(),
+			float64(pf.Simulation)/1000,
+			otelapi.WithAttributes(attribute.Bool("simulationSuccess", pf.SimulationSuccess)),
+		)
+	}
+
+	if pf.RedisUpdate > 0 {
+		metrics.SubmitNewBlockRedisLatencyHistogram.Record(
+			context.Background(),
+			float64(pf.RedisUpdate)/1000,
+			otelapi.WithAttributes(attribute.Bool("wasBidSaved", pf.WasBidSaved)),
+		)
+	}
+
+	if pf.RedisSavePayload > 0 {
+		metrics.SubmitNewBlockRedisPayloadLatencyHistogram.Record(
+			context.Background(),
+			float64(pf.RedisSavePayload)/1000,
+		)
+	}
+
+	if pf.RedisUpdateTopBid > 0 {
+		metrics.SubmitNewBlockRedisTopBidLatencyHistogram.Record(
+			context.Background(),
+			float64(pf.RedisUpdateTopBid)/1000,
+		)
+	}
+
+	if pf.RedisUpdateFloor > 0 {
+		metrics.SubmitNewBlockRedisFloorLatencyHistogram.Record(
+			context.Background(),
+			float64(pf.RedisUpdateFloor)/1000,
+		)
+	}
+
+	metrics.SubmitNewBlockLatencyHistogram.Record(
+		context.Background(),
+		float64(time.Since(receivedTime).Milliseconds()),
+		otelapi.WithAttributes(
+			attribute.String("contentType", pf.ContentType),
+			attribute.Bool("isGzip", pf.IsGzip),
+			attribute.Bool("aboveFloorBid", pf.AboveFloorBid),
+			attribute.Bool("simulationSuccess", pf.SimulationSuccess),
+			attribute.Bool("wasBidSaved", pf.WasBidSaved),
+			attribute.Bool("optimistic", pf.Optimistic),
+		),
+	)
 }
 
 // ---------------
