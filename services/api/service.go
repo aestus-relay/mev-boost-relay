@@ -952,6 +952,7 @@ func (api *RelayAPI) prepareBuildersForSlot(headSlot, prevHeadSlot uint64) {
 	api.log.Debugf("Updating builder cache with %d builders from database", len(builders))
 
 	newCache := make(map[string]*blockBuilderCacheEntry)
+	start := time.Now()
 	for _, v := range builders {
 		isOptedIntoMevCommit, err := api.datastore.IsMevCommitBlockBuilder(common.PubkeyHex(v.BuilderPubkey))
 		if err != nil {
@@ -976,6 +977,10 @@ func (api *RelayAPI) prepareBuildersForSlot(headSlot, prevHeadSlot uint64) {
 		newCache[v.BuilderPubkey] = entry
 	}
 	api.blockBuildersCache = newCache
+	api.log.WithFields(logrus.Fields{
+		"numBuilders": len(builders),
+		"builderCacheDuration": time.Since(start).Milliseconds(),
+	}).Info("Updated builder cache")
 }
 
 func (api *RelayAPI) RespondError(w http.ResponseWriter, code int, message string) {
@@ -1934,7 +1939,7 @@ func (api *RelayAPI) checkSubmissionSlotDetails(w http.ResponseWriter, log *logr
 			}
 		}
 		duration := time.Since(start)
-		log.WithField("duration", duration).Trace("mev-commit check completed")
+		log.WithField("checkDuration", duration.Microseconds()).Info("mev-commit check completed")
 	}
 
 	// Timestamp check

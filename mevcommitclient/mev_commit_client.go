@@ -184,7 +184,6 @@ func (m *MevCommitClient) ListenForBuildersEvents() (<-chan MevCommitProvider, <
 				}
 				// If we've caught up to the current block, wait before polling again
 				if lastProcessedBlock >= currentBlock {
-					m.log.WithField("currentBlock", currentBlock).Info("Caught up to current block, waiting before next poll")
 					lastProcessedBlock = currentBlock - blockRangeSize // Roll back to reprocess last chunk
 					caughtUp = true
 					time.Sleep(time.Second * 12) // Roughly one block time
