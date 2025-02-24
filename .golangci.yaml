@@ -11,7 +11,6 @@ linters:
     - gocritic
     - godot
     - godox
-    - gomnd
     - lll
     - musttag
     - mnd
@@ -29,6 +28,8 @@ linters:
     - wsl
     - interfacebloat
     - exhaustruct
+    - tenv
+    - gocognit
 
     #
     # Disabled because of generics:
@@ -37,11 +38,6 @@ linters:
     - rowserrcheck
     - sqlclosecheck
     - wastedassign
-
-    #
-    # Disabled because deprecated:
-    #
-    - execinquery
 
 linters-settings:
   #
@@ -65,6 +61,7 @@ linters-settings:
     replace-allow-list:
       - github.com/attestantio/go-builder-client
       - github.com/attestantio/go-eth2-client
+      - github.com/ethereum/go-ethereum
 
   maintidx:
     under: 5

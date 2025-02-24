@@ -123,6 +123,7 @@ redis-cli DEL boost-relay/sepolia:validators-registration boost-relay/sepolia:va
 
 * `ACTIVE_VALIDATOR_HOURS` - number of hours to track active proposers in redis (default: `3`)
 * `API_MAX_HEADER_BYTES` - http maximum header bytes (default: `60_000`)
+* `API_MAX_PAYLOAD_BYTES` - http maximum payload bytes (default: `15_728_640`)
 * `API_TIMEOUT_READ_MS` - http read timeout in milliseconds (default: `1_500`)
 * `API_TIMEOUT_READHEADER_MS` - http read header timeout in milliseconds (default: `600`)
 * `API_TIMEOUT_WRITE_MS` - http write timeout in milliseconds (default: `10_000`)
@@ -370,8 +371,8 @@ Block builders can opt into cancellations by submitting blocks to `/relay/v1/bui
 
 # Maintainers
 
-- [@metachris](https://twitter.com/metachris)
-- [@Ruteri](https://twitter.com/mmrosum)
+- [@metachris](https://x.com/metachris)
+- [@Ruteri](https://x.com/mmrosum)
 - [@avalonche](https://github.com/avalonche)
 
 # Contributing
@@ -390,7 +391,7 @@ If you find a security vulnerability on this project or any other initiative rel
 
 ## Audits
 
-- [20220822](docs/audit-20220822.md), by [lotusbumi](https://github.com/lotusbumi).
+- [20220822](https://github.com/flashbots/mev-boost-relay/blob/main/docs/docs/20220822-audit.md), by [lotusbumi](https://github.com/lotusbumi).
 
 # License
 
