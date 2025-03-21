@@ -19,6 +19,10 @@ var (
 	defaultLatencySvcURI     = common.GetEnv("LATENCY_SVC_URI", "")
 	defaultLogJSON           = os.Getenv("LOG_JSON") != ""
 	defaultLogLevel          = common.GetEnv("LOG_LEVEL", "info")
+	defaultMevCommitRPC             = common.GetEnv("MEV_COMMIT_RPC", "")
+	defaultEthereumL1RPC            = common.GetEnv("ETHEREUM_L1_RPC", "")
+	defaultProviderRegistryAddr     = common.GetEnv("PROVIDER_REGISTRY_ADDR", "")
+	defaultValidatorOptInRouterAddr = common.GetEnv("VALIDATOR_OPTIN_ROUTER_ADDR", "")
 
 	enabledAPIs           []string
 	beaconNodeURIs        []string
@@ -30,6 +34,11 @@ var (
 	postgresDSN           string
 	memcachedURIs         []string
 	latencySvcURI         string
+
+	mevCommitRPC             string
+	ethereumL1RPC            string
+	providerRegistryAddr     string
+	validatorOptInRouterAddr string
 
 	logJSON  bool
 	logLevel string

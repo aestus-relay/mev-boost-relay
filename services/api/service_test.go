@@ -38,7 +38,8 @@ const (
 	testParentHash      = "0xbd3291854dc822b7ec585925cda0e18f06af28fa2886e15f52d52dd4b6f94ed6"
 	testWithdrawalsRoot = "0x7f6d156912a4cb1e74ee37e492ad883f7f7ac856d987b3228b517e490aa0189e"
 	testPrevRandao      = "0x9962816e9d0a39fd4c80935338a741dc916d1545694e41eb5a505e1a3098f9e4"
-	testBuilderPubkey   = "0xb872a4f5f596ea7dfd695e45afbe4551b405b10dafba98b2d897c58a5047fc288ef2c1bc4216f906ea05d7fdbed61116"
+	testBuilderPubkey   = "0xfa1ed37c3553d0ce1e9349b2c5063cf6e394d231c8d3e0df75e9462257c081543086109ffddaacc0aa76f33dc9661c83"
+	validatorPubKey     = "0x6ae5932d1e248d987d51b58665b81848814202d7b23b343d20f2a167d12f07dcb01ca41c42fdd60b7fca9c4b90890792"
 )
 
 var (
@@ -906,6 +907,9 @@ func TestCheckSubmissionPayloadAttrs(t *testing.T) {
 			backend.relay.payloadAttributesLock.RLock()
 			backend.relay.payloadAttributes[getPayloadAttributesKey(testParentHash, testSlot)] = tc.attrs
 			backend.relay.payloadAttributesLock.RUnlock()
+			backend.relay.blockBuildersCache[testBuilderPubkey] = &blockBuilderCacheEntry{
+				mevCommitOptInStatus: true,
+			}
 
 			w := httptest.NewRecorder()
 			logger := logrus.New()
@@ -919,10 +923,13 @@ func TestCheckSubmissionPayloadAttrs(t *testing.T) {
 }
 
 func TestCheckSubmissionSlotDetails(t *testing.T) {
+	builderPubkey, err := utils.HexToPubkey(testBuilderPubkey)
+	require.NoError(t, err)
 	cases := []struct {
-		description string
-		payload     *common.VersionedSubmitBlockRequest
-		expectOk    bool
+		description          string
+		payload              *common.VersionedSubmitBlockRequest
+		expectOk             bool
+		mevCommitOptInStatus bool
 	}{
 		{
 			description: "success",
@@ -934,12 +941,14 @@ func TestCheckSubmissionSlotDetails(t *testing.T) {
 							Timestamp: testSlot * common.SecondsPerSlot,
 						},
 						Message: &builderApiV1.BidTrace{
-							Slot: testSlot,
+							Slot:          testSlot,
+							BuilderPubkey: builderPubkey,
 						},
 					},
 				},
 			},
-			expectOk: true,
+			expectOk:             true,
+			mevCommitOptInStatus: true,
 		},
 		{
 			description: "non_capella_slot",
@@ -1012,6 +1021,7 @@ func TestCheckSubmissionSlotDetails(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.description, func(t *testing.T) {
 			_, _, backend := startTestBackend(t)
+			validatorPubKey, _ := utils.HexToPubkey(testBuilderPubkey)
 			backend.relay.capellaEpoch = 1
 			backend.relay.denebEpoch = 2
 			backend.relay.electraEpoch = 3
@@ -1021,6 +1031,19 @@ func TestCheckSubmissionSlotDetails(t *testing.T) {
 			log := logrus.NewEntry(logger)
 			submission, err := common.GetBlockSubmissionInfo(tc.payload)
 			require.NoError(t, err)
+			backend.relay.proposerDutiesMap = make(map[uint64]*common.BuilderGetValidatorsResponseEntry)
+			backend.relay.proposerDutiesMap[testSlot] = &common.BuilderGetValidatorsResponseEntry{
+				Slot: testSlot,
+				Entry: &builderApiV1.SignedValidatorRegistration{
+					Message: &builderApiV1.ValidatorRegistration{
+						Pubkey: validatorPubKey,
+					},
+				},
+				IsMevCommitValidator: tc.mevCommitOptInStatus,
+			}
+			backend.relay.blockBuildersCache[testBuilderPubkey] = &blockBuilderCacheEntry{
+				mevCommitOptInStatus: tc.mevCommitOptInStatus,
+			}
 			ok := backend.relay.checkSubmissionSlotDetails(w, log, headSlot, tc.payload, submission)
 			require.Equal(t, tc.expectOk, ok)
 		})
@@ -1044,6 +1067,7 @@ func TestCheckBuilderEntry(t *testing.T) {
 				status: common.BuilderStatus{
 					IsHighPrio: true,
 				},
+				mevCommitOptInStatus: true,
 			},
 			pk:       builderPubkey,
 			expectOk: true,
@@ -1083,8 +1107,11 @@ func TestCheckBuilderEntry(t *testing.T) {
 			w := httptest.NewRecorder()
 			logger := logrus.New()
 			log := logrus.NewEntry(logger)
-			_, ok := backend.relay.checkBuilderEntry(w, log, builderPubkey)
+			entry, ok := backend.relay.checkBuilderEntry(w, log, builderPubkey)
 			require.Equal(t, tc.expectOk, ok)
+			if ok {
+				require.Equal(t, tc.entry.mevCommitOptInStatus, entry.mevCommitOptInStatus)
+			}
 		})
 	}
 }

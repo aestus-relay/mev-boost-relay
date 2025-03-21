@@ -155,6 +155,8 @@ type RelayAPIOpts struct {
 	DataAPI         bool
 	PprofAPI        bool
 	InternalAPI     bool
+
+	MevCommitFiltering bool
 }
 
 type payloadAttributesHelper struct {
@@ -175,8 +177,9 @@ type blockSimOptions struct {
 }
 
 type blockBuilderCacheEntry struct {
-	status     common.BuilderStatus
-	collateral *big.Int
+	status               common.BuilderStatus
+	collateral           *big.Int
+	mevCommitOptInStatus bool
 }
 
 type blockSimResult struct {
@@ -219,8 +222,7 @@ type RelayAPI struct {
 	isUpdatingProposerDuties uberatomic.Bool
 
 	blockSimRateLimiter IBlockSimRateLimiter
-
-	validatorRegC chan builderApiV1.SignedValidatorRegistration
+	validatorRegC       chan builderApiV1.SignedValidatorRegistration
 
 	// used to notify when a new validator has been registered
 	validatorUpdateCh chan struct{}
@@ -380,6 +382,7 @@ func (api *RelayAPI) getRouter() http.Handler {
 	if api.opts.BlockBuilderAPI {
 		api.log.Info("block builder API enabled")
 		r.HandleFunc(pathBuilderGetValidators, api.handleBuilderGetValidators).Methods(http.MethodGet)
+		// TODO: Need to update this endpoint to reject requests with a unregistered builder pubkey for a target slot
 		r.HandleFunc(pathSubmitNewBlock, api.handleSubmitNewBlock).Methods(http.MethodPost)
 	}
 
@@ -637,7 +640,7 @@ func (api *RelayAPI) simulateBlock(ctx context.Context, opts blockSimOptions) (b
 	if validationErr != nil {
 		if api.ffIgnorableValidationErrors {
 			// Operators chooses to ignore certain validation errors
-			ignoreError := validationErr.Error() == ErrBlockAlreadyKnown || validationErr.Error() == ErrBlockRequiresReorg || strings.Contains(validationErr.Error(), ErrMissingTrieNode)
+			ignoreError := validationErr.Error() == ErrBlockAlreadyKnown || validationErr.Error() == ErrBlockRequiresReorg || strings.Contains(validationErr.Error(), ErrMissingTrieNode) || strings.Contains(validationErr.Error(), ErrUnknownAncestor)
 			if ignoreError {
 				log.WithError(validationErr).Warn("block validation failed with ignorable error")
 				return nil, nil, nil
@@ -734,7 +737,7 @@ func (api *RelayAPI) processOptimisticBlock(opts blockSimOptions, simResultC cha
 		}
 
 		// Check for errors for which we will not demote unless the block wins the slot
-		ignoreError := strings.Contains(demotionErr.Error(), ErrUnknownAncestor) || strings.Contains(demotionErr.Error(), ErrProxyingRequest) || strings.Contains(demotionErr.Error(), ErrQueueTimeout) || strings.Contains(demotionErr.Error(), ErrBlockRequiresReorg)
+		ignoreError := strings.Contains(demotionErr.Error(), ErrProxyingRequest) || strings.Contains(demotionErr.Error(), ErrQueueTimeout) || strings.Contains(demotionErr.Error(), ErrBlockRequiresReorg)
 		if ignoreError {
 			opts.log.WithError(demotionErr).Warn("Ignorable validation error, deferring demotion check")
 			blockHash := submission.BidTrace.BlockHash.String()
@@ -965,13 +968,19 @@ func (api *RelayAPI) prepareBuildersForSlot(headSlot, prevHeadSlot uint64) {
 	api.log.Debugf("Updating builder cache with %d builders from database", len(builders))
 
 	newCache := make(map[string]*blockBuilderCacheEntry)
+	start := time.Now()
 	for _, v := range builders {
+		isOptedIntoMevCommit, err := api.datastore.IsMevCommitBlockBuilder(common.PubkeyHex(v.BuilderPubkey))
+		if err != nil {
+			api.log.WithError(err).Errorf("error getting mev-commit opt-in status for builder %s", v.BuilderPubkey)
+		}
 		entry := &blockBuilderCacheEntry{ //nolint:exhaustruct
 			status: common.BuilderStatus{
 				IsHighPrio:    v.IsHighPrio,
 				IsBlacklisted: v.IsBlacklisted,
 				IsOptimistic:  v.IsOptimistic,
 			},
+			mevCommitOptInStatus: isOptedIntoMevCommit,
 		}
 		// Try to parse builder collateral string to big int.
 		builderCollateral, ok := big.NewInt(0).SetString(v.Collateral, 10)
@@ -984,6 +993,10 @@ func (api *RelayAPI) prepareBuildersForSlot(headSlot, prevHeadSlot uint64) {
 		newCache[v.BuilderPubkey] = entry
 	}
 	api.blockBuildersCache = newCache
+	api.log.WithFields(logrus.Fields{
+		"numBuilders": len(builders),
+		"builderCacheDuration": time.Since(start).Milliseconds(),
+	}).Info("Updated builder cache")
 }
 
 func (api *RelayAPI) RespondError(w http.ResponseWriter, code int, message string) {
@@ -1767,6 +1780,7 @@ func (api *RelayAPI) handleGetPayload(w http.ResponseWriter, req *http.Request) 
 			return
 		}
 
+		// TODO(@ckartik): We could do something similar for validator registrations with L1 mevcommit contract.
 		// Get registration entry from the DB.
 		registrationEntry, err := api.db.GetValidatorRegistration(proposerPubkey.String())
 		if err != nil {
@@ -2007,6 +2021,39 @@ func (api *RelayAPI) checkSubmissionSlotDetails(w http.ResponseWriter, log *logr
 		return false
 	}
 
+	if api.opts.MevCommitFiltering {
+		start := time.Now()
+		// Find the duty for the submission slot
+		api.proposerDutiesLock.RLock()
+		duty := api.proposerDutiesMap[submission.BidTrace.Slot]
+		api.proposerDutiesLock.RUnlock()
+		if duty == nil {
+			log.Info("no duty found for submission slot")
+			api.RespondError(w, http.StatusBadRequest, "no duty found for submission slot")
+			return false
+		}
+		if duty.IsMevCommitValidator {
+			builderCacheEntry, ok := api.blockBuildersCache[submission.BidTrace.BuilderPubkey.String()]
+			if !ok {
+				isBuilderRegistered, err := api.datastore.IsMevCommitBlockBuilder(common.NewPubkeyHex(submission.BidTrace.BuilderPubkey.String()))
+				if err != nil {
+					log.WithError(err).Error("Failed to check builder registration")
+					api.RespondError(w, http.StatusInternalServerError, "Internal server error")
+					return false
+				}
+				if !isBuilderRegistered {
+					api.RespondError(w, http.StatusBadRequest, "Builder pubkey is not registered under mev-commit")
+					return false
+				}
+			} else if !builderCacheEntry.mevCommitOptInStatus {
+				api.RespondError(w, http.StatusBadRequest, "Builder pubkey is not opted into mev-commit")
+				return false
+			}
+		}
+		duration := time.Since(start)
+		log.WithField("checkDuration", duration.Microseconds()).Info("mev-commit check completed")
+	}
+
 	// Timestamp check
 	expectedTimestamp := api.genesisInfo.Data.GenesisTime + (submission.BidTrace.Slot * common.SecondsPerSlot)
 	if submission.Timestamp != expectedTimestamp {
@@ -2156,6 +2203,7 @@ func (api *RelayAPI) buildAndSaveResponses(pipeliner datastore.RedisPipeliner, p
 	return getHeaderResponse, getPayloadResponse, &bidTrace, err
 }
 
+// TODO: Need to update this endpoint to reject requests with a unregistered builder pubkey for a target slot
 func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Request) {
 	var pf common.Profile
 	var prevTime, nextTime time.Time
