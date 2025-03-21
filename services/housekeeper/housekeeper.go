@@ -262,19 +262,22 @@ func (hk *Housekeeper) UpdateProposerDutiesWithoutChecks(headSlot uint64) {
 	booleanValidatorRegistrationsArray, err := hk.mevCommitClient.GetOptInStatusForValidators(pubkeys)
 	if err != nil {
 		hk.log.WithError(err).Error("failed to get registered validators from mev-commit client")
-		return
 	}
 
 	// Prepare proposer duties
 	proposerDuties := []common.BuilderGetValidatorsResponseEntry{}
 	for i, duty := range entries {
 		reg := signedValidatorRegistrations[duty.Pubkey]
+		isMevCommitValidator := false
+		if i < len(booleanValidatorRegistrationsArray) {
+			isMevCommitValidator = booleanValidatorRegistrationsArray[i]
+		}
 		if reg != nil {
 			proposerDuties = append(proposerDuties, common.BuilderGetValidatorsResponseEntry{
 				Slot:                 duty.Slot,
 				ValidatorIndex:       duty.ValidatorIndex,
 				Entry:                reg,
-				IsMevCommitValidator: booleanValidatorRegistrationsArray[i],
+				IsMevCommitValidator: isMevCommitValidator,
 			})
 		}
 	}
