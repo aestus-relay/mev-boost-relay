@@ -1930,16 +1930,18 @@ func (api *RelayAPI) checkSubmissionSlotDetails(w http.ResponseWriter, log *logr
 					return false
 				}
 				if !isBuilderRegistered {
+					log.Info("builder pubkey is not registered under mev-commit")
 					api.RespondError(w, http.StatusBadRequest, "Builder pubkey is not registered under mev-commit")
 					return false
 				}
 			} else if !builderCacheEntry.mevCommitOptInStatus {
+				log.Info("builder pubkey is not opted into mev-commit")
 				api.RespondError(w, http.StatusBadRequest, "Builder pubkey is not opted into mev-commit")
 				return false
 			}
+			duration := time.Since(start)
+			log.WithField("checkDuration", duration.Microseconds()).Info("mev-commit check completed")
 		}
-		duration := time.Since(start)
-		log.WithField("checkDuration", duration.Microseconds()).Info("mev-commit check completed")
 	}
 
 	// Timestamp check

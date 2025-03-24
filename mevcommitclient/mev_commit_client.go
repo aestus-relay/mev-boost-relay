@@ -16,13 +16,14 @@ import (
 	"github.com/ethereum/go-ethereum/accounts/abi/bind"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/ethclient"
+	mbrcommon "github.com/flashbots/mev-boost-relay/common"
 	providerRegistry "github.com/primev/mev-commit/contracts-abi/clients/ProviderRegistry"
 	validatoroptinrouter "github.com/primev/mev-commit/contracts-abi/clients/ValidatorOptInRouter"
 	"github.com/sirupsen/logrus"
 )
 
 type MevCommitProvider struct {
-	Pubkey     []byte
+	Pubkey     mbrcommon.PubkeyHex
 	EOAAddress common.Address
 }
 
@@ -238,8 +239,9 @@ func (m *MevCommitClient) filterEvents(ctx context.Context, builderRegistryEvent
 		case <-ctx.Done():
 			return nil
 		default:
+			pubkeyHex := mbrcommon.NewPubkeyHex(fmt.Sprintf("0x%x", blsKeyEvents.Event.BlsPublicKey))
 			builderRegistryEventCh <- MevCommitProvider{
-				Pubkey:     blsKeyEvents.Event.BlsPublicKey,
+				Pubkey:     pubkeyHex,
 				EOAAddress: blsKeyEvents.Event.Provider,
 			}
 		}

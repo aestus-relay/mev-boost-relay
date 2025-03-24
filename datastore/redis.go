@@ -343,7 +343,7 @@ func (r *RedisCache) SetMevCommitBlockBuilder(builder mevcommitclient.MevCommitP
 	if err != nil {
 		return fmt.Errorf("failed to marshal MevCommitProvider: %w", err)
 	}
-	err = r.client.HSet(ctx, r.keyMevCommitBlockBuilder, builder.Pubkey, string(jsonBuilder)).Err()
+	err = r.client.HSet(ctx, r.keyMevCommitBlockBuilder, string(builder.Pubkey), string(jsonBuilder)).Err()
 	if err != nil {
 		return fmt.Errorf("failed to set mev-commit block builder: %w", err)
 	}
