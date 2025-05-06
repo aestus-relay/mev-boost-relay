@@ -975,14 +975,14 @@ func (r *RedisCache) NewPipeline() redis.Pipeliner { //nolint:ireturn,nolintlint
 	return r.client.Pipeline()
 }
 
-func (r *RedisCache) NewTxPipeline() RedisPipeliner { //nolint:ireturn
+func (r *RedisCache) NewTxPipeline() RedisPipeliner { //nolint:ireturn,nolintlint
 	return &redisPipelinerImpl{r.client.TxPipeline()}
 }
 
-func (r *RedisCache) NewTxBidEnginePipeline() BidEnginePipeliner { //nolint:ireturn
+func (r *RedisCache) NewTxBidEnginePipeline() BidEnginePipeliner { //nolint:ireturn,nolintlint
 	return &bidEnginePipelinerImpl{r.bidEngineClient.TxPipeline()}
 }
 
-func (r *RedisCache) NewTxBidEngineROPipeline() BidEnginePipeliner { //nolint:ireturn
+func (r *RedisCache) NewTxBidEngineROPipeline() BidEnginePipeliner { //nolint:ireturn,nolintlint
 	return &bidEnginePipelinerImpl{r.bidEngineROClient.TxPipeline()}
 }
