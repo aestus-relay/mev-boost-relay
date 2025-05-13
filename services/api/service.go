@@ -53,7 +53,7 @@ const (
 	ErrBlockAlreadyKnown  = "simulation failed: block already known"
 	ErrBlockRequiresReorg = "simulation failed: block requires a reorg"
 	ErrMissingTrieNode    = "missing trie node"
-	ErrUnknownAncestor    = "unknown ancestor"
+	ErrParentBlock        = "parent block not found"
 	ErrProxyingRequest    = "proxying request failed"
 	ErrQueueTimeout       = "(Client.Timeout exceeded while awaiting headers)"
 
@@ -648,7 +648,7 @@ func (api *RelayAPI) simulateBlock(ctx context.Context, opts blockSimOptions) (b
 	if validationErr != nil {
 		if api.ffIgnorableValidationErrors {
 			// Operators chooses to ignore certain validation errors
-			ignoreError := validationErr.Error() == ErrBlockAlreadyKnown || validationErr.Error() == ErrBlockRequiresReorg || strings.Contains(validationErr.Error(), ErrMissingTrieNode) || strings.Contains(validationErr.Error(), ErrUnknownAncestor)
+			ignoreError := validationErr.Error() == ErrBlockAlreadyKnown || validationErr.Error() == ErrBlockRequiresReorg || strings.Contains(validationErr.Error(), ErrMissingTrieNode) || strings.Contains(validationErr.Error(), ErrParentBlock)
 			if ignoreError {
 				log.WithError(validationErr).Warn("block validation failed with ignorable error")
 				return nil, nil, nil
