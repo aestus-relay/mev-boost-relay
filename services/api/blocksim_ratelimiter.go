@@ -3,7 +3,6 @@ package api
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -16,6 +15,7 @@ import (
 	"github.com/flashbots/go-utils/cli"
 	"github.com/flashbots/go-utils/jsonrpc"
 	"github.com/flashbots/mev-boost-relay/common"
+	"github.com/goccy/go-json"
 )
 
 var (
@@ -172,6 +172,9 @@ func SendJSONRPCRequest(client *http.Client, req jsonrpc.JSONRPCRequest, url str
 	}
 
 	if res.Error != nil {
+		if res.Error.Data != nil {
+			return res, nil, fmt.Errorf("%w: %s (%v)", ErrSimulationFailed, res.Error.Message, res.Error.Data)
+		}
 		return res, nil, fmt.Errorf("%w: %s", ErrSimulationFailed, res.Error.Message)
 	}
 	return res, nil, nil

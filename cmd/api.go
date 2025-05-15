@@ -25,7 +25,7 @@ var (
 	apiDefaultLogTag     = os.Getenv("LOG_TAG")
 
 	apiDefaultAPIs               = strings.Split(common.GetEnv("APIS", "proposer,builder,data"), ",")
-	apiDefaultPprofEnabled       = os.Getenv("PPROF") == "1"
+	apiDefaultPprofListenAddr    = os.Getenv("PPROF_ADDR")
 	apiDefaultInternalAPIEnabled = os.Getenv("ENABLE_INTERNAL_API") == "1"
 
 	// Default Builder, Data, and Proposer API as false.
@@ -36,7 +36,7 @@ var (
 
 	apiMevCommitFiltering bool
 	apiListenAddr         string
-	apiPprofEnabled       bool
+	apiPprofListenAddr    string
 	apiSecretKey          string
 	apiBlockSimURL        string
 	apiDebug              bool
@@ -70,7 +70,7 @@ func init() {
 	apiCmd.Flags().StringVar(&network, "network", defaultNetwork, "Which network to use")
 
 	apiCmd.Flags().StringSliceVar(&enabledAPIs, "apis", apiDefaultAPIs, "APIs to enable")
-	apiCmd.Flags().BoolVar(&apiPprofEnabled, "pprof", apiDefaultPprofEnabled, "enable pprof API")
+	apiCmd.Flags().StringVar(&apiPprofListenAddr, "pprof-listen-addr", apiDefaultPprofListenAddr, "listen address for pprof, empty to disable")
 	apiCmd.Flags().BoolVar(&apiBuilderAPI, "builder-api", apiDefaultBuilderAPIEnabled, "enable builder API (/builder/...)")
 	apiCmd.Flags().BoolVar(&apiDataAPI, "data-api", apiDefaultDataAPIEnabled, "enable data API (/data/...)")
 	apiCmd.Flags().BoolVar(&apiInternalAPI, "internal-api", apiDefaultInternalAPIEnabled, "enable internal API (/internal/...)")
@@ -178,11 +178,12 @@ var apiCmd = &cobra.Command{
 			BlockSimURL:   apiBlockSimURL,
 
 			MevCommitFiltering: apiMevCommitFiltering,
+			PprofListenAddr: apiPprofListenAddr,
+
 			BlockBuilderAPI: apiBuilderAPI,
 			DataAPI:         apiDataAPI,
 			InternalAPI:     apiInternalAPI,
 			ProposerAPI:     apiProposerAPI,
-			PprofAPI:        apiPprofEnabled,
 		}
 
 		// Update APIs from enabled list
@@ -196,8 +197,6 @@ var apiCmd = &cobra.Command{
 				opts.DataAPI = true
 			case "internal":
 				opts.InternalAPI = true
-			case "pprof":
-				opts.PprofAPI = true
 			default:
 				log.Fatalf("API " + name + " not recognized")
 			}

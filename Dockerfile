@@ -9,7 +9,7 @@ RUN --mount=type=cache,target=/root/.cache/go-build go mod download
 
 # Now adding all the code and start building
 ADD . .
-RUN --mount=type=cache,target=/root/.cache/go-build GOOS=linux go build -trimpath -ldflags "-s -X cmd.Version=$VERSION -X main.Version=$VERSION" -v -o mev-boost-relay .
+RUN --mount=type=cache,target=/root/.cache/go-build GOOS=linux go build -trimpath -ldflags "-X cmd.Version=$VERSION -X main.Version=$VERSION" -v -o mev-boost-relay .
 
 # Copy to executable container
 FROM golang:1.20

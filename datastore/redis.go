@@ -2,7 +2,6 @@ package datastore
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"math/big"
@@ -18,6 +17,7 @@ import (
 	"github.com/attestantio/go-eth2-client/spec/capella"
 	"github.com/flashbots/go-utils/cli"
 	"github.com/flashbots/mev-boost-relay/common"
+	"github.com/goccy/go-json"
 	"github.com/redis/go-redis/v9"
 	"github.com/flashbots/mev-boost-relay/mevcommitclient"
 )
@@ -337,9 +337,9 @@ func (r *RedisCache) HSetObj(key, field string, value any, expiration time.Durat
 
 func (r *RedisCache) GetValidatorRegistrationData(proposerPubkey common.PubkeyHex) (*builderApiV1.ValidatorRegistration, error) {
 	data := new(builderApiV1.ValidatorRegistration)
-	pk := strings.ToLower(proposerPubkey.String())
 
-	dataRaw, err := r.client.HGet(context.Background(), r.keyValidatorRegistrationData, pk).Result()
+	// common.PubkeyHex is lowercase at the time of creation
+	dataRaw, err := r.client.HGet(context.Background(), r.keyValidatorRegistrationData, proposerPubkey.String()).Result()
 	if errors.Is(err, redis.Nil) {
 		return nil, nil
 	}
