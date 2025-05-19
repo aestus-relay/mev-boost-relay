@@ -21,9 +21,12 @@ var (
 )
 
 var (
-	defaultClientRttMs = cli.GetEnvInt("DEFAULT_CLIENT_RTT_MS", 300)
-	rttToHandshakeScale = common.GetEnvFloat("RTT_TO_HANDSHAKE_SCALE", 1.5)
-	rttToResponseScale = common.GetEnvFloat("RTT_TO_RESPONSE_SCALE", 0.5)
+	defaultClientRttMs    = cli.GetEnvInt("DEFAULT_CLIENT_RTT_MS", 300)
+	rttToHandshakeScale   = common.GetEnvFloat("RTT_TO_HANDSHAKE_SCALE", 1.5)
+	rttToResponseScale    = common.GetEnvFloat("RTT_TO_RESPONSE_SCALE", 0.5)
+
+	clientTimingHeader    = "Date-Milliseconds"
+	clientOldTimingHeader = "X-MEVBoost-StartTimeUnixMS"
 )
 
 type LatencyRequest struct {
@@ -106,9 +109,14 @@ func (le *LatencyEstimator) GetClientIP(r *http.Request) (clientIP string, err e
 }
 
 func (le *LatencyEstimator) GetStartTime(r *http.Request) (timeMs uint64, err error) {
-	startTimeStr := r.Header.Get("X-MEVBoost-StartTimeUnixMS")
+	startTimeStr := r.Header.Get(clientTimingHeader)
 	if startTimeStr == "" {
-		return 0, errors.New("no start time in header")
+		// Try the old header
+		startTimeStr = r.Header.Get(clientOldTimingHeader)
+
+		if startTimeStr == "" {
+			return 0, errors.New("no start time in header")
+		}
 	}
 	startTimeMs, err := strconv.ParseUint(startTimeStr, 10, 64)
 	if err != nil {
