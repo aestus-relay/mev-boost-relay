@@ -1,9 +1,10 @@
 #!lua name=topbid
 
-local function formatTopBidUpdateMsg(topBidJSON, slot, timestamp)
+local function formatTopBidUpdateMsg(topBidJSON, slot, timestamp, builderPubkey)
    return '{' ..
       '  "slot": ' .. slot .. ',' ..
       '  "timestamp": ' .. timestamp .. ',' ..
+      '  "builderPubkey": "' .. (builderPubkey) .. '",' ..
       '  "getHeaderResponse": ' .. topBidJSON ..
       '}'
 end
@@ -73,7 +74,7 @@ local function updateTopBid(keys, args)
    -- Publish the new top bid if it changed
    if newTopValue ~= prevTopValue then
       local topGetHeaderResp = redis.call('GET', keys[4])
-      local topBidUpdate = formatTopBidUpdateMsg(topGetHeaderResp, args[4], getCurrentTimeMs())
+      local topBidUpdate = formatTopBidUpdateMsg(topGetHeaderResp, args[4], getCurrentTimeMs(), topPubkey)
       redis.call('PUBLISH', args[3], topBidUpdate)
    end
    return true
@@ -148,7 +149,7 @@ local function processBidAndUpdateTopBid(keys, args)
    performTopBidUpdate(args[3], newTopPubkey, newTopValue, keys[7], floorBidValue, keys[5], keys[6], args[7])
 
    -- Publish a top bid update
-   local topBidUpdateMsg = formatTopBidUpdateMsg(args[5], args[9], getCurrentTimeMs())
+   local topBidUpdateMsg = formatTopBidUpdateMsg(args[5], args[9], getCurrentTimeMs(), newTopPubkey)
    redis.call('PUBLISH', args[8], topBidUpdateMsg)
 
    -- A non-cancellable bid above the floor should set a new floor
