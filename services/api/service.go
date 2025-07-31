@@ -1871,7 +1871,8 @@ func (api *RelayAPI) handleGetPayload(w http.ResponseWriter, req *http.Request) 
 
 	timeAfterPublish := time.Now().UTC().UnixMilli()
 	msNeededForPublishing = uint64(timeAfterPublish - timeBeforePublish) //nolint:gosec
-	log = log.WithField("timestampAfterPublishing", timeAfterPublish)
+	publishMsIntoSlot := time.Now().UTC().UnixMilli() - int64(slotStartTimestamp*1000) //nolint:gosec
+	log = log.WithField("timestampAfterPublishing", timeAfterPublish).WithField("publishMsIntoSlot", publishMsIntoSlot)
 	log.WithField("msNeededForPublishing", msNeededForPublishing).Info("block published through beacon node")
 	metrics.PublishBlockLatencyHistogram.Record(req.Context(), float64(msNeededForPublishing))
 
