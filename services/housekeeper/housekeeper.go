@@ -191,11 +191,13 @@ func (hk *Housekeeper) monitorMevCommitBuilderRegistrations() {
 			hk.log.WithField("builder", builder).Info("new builder registered")
 			err := hk.redis.SetMevCommitBlockBuilder(builder)
 			if err != nil {
+				hk.log.WithField("builder", builder).Info("failed to set mev-commit builder registration")
 				hk.log.WithError(err).Error("failed to set mev-commit builder registration")
 			}
 		case builderAddress := <-builderUnregistered:
 			entries, err := hk.redis.GetMevCommitBlockBuilders()
 			if err != nil {
+				hk.log.WithField("builder", builderAddress).Info("failed to get mev-commit block builders from Redis")
 				hk.log.WithError(err).Error("failed to get mev-commit block builders from Redis")
 				return
 			}
