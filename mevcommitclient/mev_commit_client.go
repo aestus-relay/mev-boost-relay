@@ -12,7 +12,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/ethereum/go-ethereum/accounts/abi"
 	"github.com/ethereum/go-ethereum/accounts/abi/bind"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/ethclient"
@@ -43,13 +42,8 @@ type MevCommitClient struct {
 	builderRegistryFilterer    *providerRegistry.ProviderregistryFilterer
 	l1Client                   *ethclient.Client
 	mevCommitClient            *ethclient.Client
-	contractAbi                abi.ABI
 	log                        *logrus.Entry
 }
-
-const (
-	abiJSON = `[{"anonymous":false,"inputs":[{"indexed":true,"internalType":"address","name":"builder","type":"address"},{"indexed":false,"internalType":"uint256","name":"value","type":"uint256"},{"indexed":false,"internalType":"bytes","name":"blsPublicKey","type":"bytes"}],"name":"BuilderRegistered","type":"event"},{"inputs":[{"internalType":"address","name":"builder","type":"address"}],"name":"isBuilderValid","outputs":[],"stateMutability":"view","type":"function"}]`
-)
 
 func NewMevCommitClient(l1MainnetURL, mevCommitURL string, validatorRouterAddress, ProviderRegistryAddress common.Address, log *logrus.Entry) (IMevCommitClient, error) {
 	l1Client, err := ethclient.Dial(l1MainnetURL)
@@ -81,11 +75,6 @@ func NewMevCommitClient(l1MainnetURL, mevCommitURL string, validatorRouterAddres
 		return nil, fmt.Errorf("failed to create BuilderRegistry filterer: %w", err)
 	}
 
-	contractAbi, err := abi.JSON(strings.NewReader(abiJSON))
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse contract ABI: %w", err)
-	}
-
 	return &MevCommitClient{
 		L1Address:                  l1MainnetURL,
 		MevCommitAddress:           mevCommitURL,
@@ -96,7 +85,6 @@ func NewMevCommitClient(l1MainnetURL, mevCommitURL string, validatorRouterAddres
 		builderRegistryFilterer:    builderRegistryFilterer,
 		l1Client:                   l1Client,
 		mevCommitClient:            mevCommitClient,
-		contractAbi:                contractAbi,
 		log:                        log,
 	}, nil
 }
