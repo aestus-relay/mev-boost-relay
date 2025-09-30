@@ -176,7 +176,7 @@ func (m *MevCommitClient) ListenForBuildersEvents() (<-chan MevCommitProvider, <
 					if currentBlock > blockRangeSize {
 						lastProcessedBlock = currentBlock - blockRangeSize
 					} else {
-						lastProcessedBlock = 0
+						lastProcessedBlock = currentBlock
 					}
 					caughtUp = true
 					time.Sleep(time.Second * 12) // Roughly one block time
